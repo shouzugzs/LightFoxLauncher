@@ -132,11 +132,11 @@ impl Settings {
             .map_err(|e| format!("cannot replace {}: {e}", target.display()))
     }
 
-    /// `load` + `apply` in one call.
+    /// `load` + validate + `apply` in one call. See the free function
+    /// [`load_and_apply`] — the impl method forwards to it so both spellings
+    /// behave the same.
     pub fn load_and_apply(dir: &Path) -> Settings {
-        let s = Settings::load(dir);
-        s.apply();
-        s
+        load_and_apply(dir)
     }
 
     /// Cross-check the values a settings form can produce.
@@ -145,6 +145,14 @@ impl Settings {
         crate::launcher::validate_instance_name(&self.instance)?;
         if self.user.is_empty() || self.user.len() > 16 {
             return Err("player name must be 1..=16 characters".to_string());
+        }
+        // The player name becomes a JVM argument (`--username`). The launcher's
+        // own `Options::validate` rejects control characters, but this file can
+        // also be *hand-edited*, and `load_and_apply` does not re-validate — so
+        // the check has to exist here too, or a newline in `lfl-settings.ini`
+        // reaches the game's command line unchecked.
+        if self.user.chars().any(|c| c.is_control()) {
+            return Err("player name must not contain control characters".to_string());
         }
         if self.workers > crate::net::MAX_WORKERS_LIMIT {
             return Err(format!(
@@ -171,9 +179,29 @@ impl Settings {
     }
 }
 
-/// `load` → `apply`, the normal startup path.
+/// `load` → validate → apply, the normal startup path.
+///
+/// The validate step was missing: the ini is documented as human-editable, so
+/// the file on disk is **untrusted input**, and the loaded values reach a
+/// command line (the player name becomes `--username`). A hand-edited ini with
+/// a control character in `user` used to pass straight through to the JVM.
+///
+/// On invalid values the defaults are applied instead of the file's, and the
+/// file is left untouched — the next successful save from the 设置 page rewrites
+/// it with valid content.
 pub fn load_and_apply(dir: &Path) -> Settings {
     let s = Settings::load(dir);
+    match s.validate() {
+        Ok(()) => {}
+        Err(e) => {
+            crate::util::info(&format!(
+                "settings: ignoring invalid value(s) ({e}); using defaults for this run"
+            ));
+            let d = Settings::default();
+            d.apply();
+            return d;
+        }
+    }
     s.apply();
     s
 }
