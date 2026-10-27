@@ -261,11 +261,17 @@ pub const SWP_NOACTIVATE: UINT = 0x0010;
 pub const SWP_SHOWWINDOW: UINT = 0x0040;
 pub const SW_HIDE: i32 = 0;
 
+pub const WM_SETICON: UINT = 0x0080;
 pub const ICON_BIG: DWORD = 1;
 pub const IMAGE_ICON: UINT = 1;
 pub const LR_LOADFROMFILE: UINT = 0x0010;
 pub const LR_DEFAULTSIZE: UINT = 0x0040;
 pub const LR_SHARED: UINT = 0x8000;
+
+/// `CreateDIBSection` colour-table usage: colours are literal RGB, not palette.
+pub const DIB_RGB_COLORS: UINT = 0;
+/// Uncompressed DIB (`biCompression`).
+pub const BI_RGB: u32 = 0;
 
 pub const BD: i32 = 0x0055; // GDI hatch/pen helper is not used, kept for clarity
 
@@ -384,6 +390,10 @@ extern "system" {
         pitch_and_family: DWORD,
         face: *const u16,
     ) -> HFONT;
+    /// A device-independent bitmap the caller can paint into (icon colour plane).
+    pub fn CreateCompatibleBitmap(hdc: HDC, w: i32, h: i32) -> HBITMAP;
+    /// A 1-bpp monochrome bitmap (icon mask plane).
+    pub fn CreateBitmap(w: i32, h: i32, planes: u32, bits: u32, bits_ptr: *const c_void) -> HBITMAP;
     pub fn CreateSolidBrush(color: u32) -> HBRUSH;
     pub fn CreatePen(style: i32, width: i32, color: u32) -> HGDIOBJ;
     pub fn DeleteObject(obj: HGDIOBJ) -> BOOL;
@@ -395,6 +405,23 @@ extern "system" {
     pub fn RoundRect(hdc: HDC, l: i32, t: i32, r: i32, b: i32, ew: i32, eh: i32) -> BOOL;
     pub fn MoveToEx(hdc: HDC, x: i32, y: i32, prev: *mut POINT) -> BOOL;
     pub fn LineTo(hdc: HDC, x: i32, y: i32) -> BOOL;
+    /// Closed filled polygon from a point array (the fox glyph is built from these).
+    pub fn Polygon(hdc: HDC, pts: *const POINT, count: i32) -> BOOL;
+    /// Open polyline (outline, not filled).
+    pub fn Polyline(hdc: HDC, pts: *const POINT, count: i32) -> BOOL;
+    /// Filled ellipse.
+    pub fn Ellipse(hdc: HDC, l: i32, t: i32, r: i32, b: i32) -> BOOL;
+    /// A DIB section the caller can write pixels into; used to build the icon.
+    pub fn CreateDIBSection(
+        hdc: HDC,
+        info: *const BITMAPINFO,
+        usage: UINT,
+        bits: *mut *mut c_void,
+        section: *mut c_void,
+        offset: DWORD,
+    ) -> HBITMAP;
+    /// Pack a mask+colour bitmap into an `HICON`.
+    pub fn CreateIconIndirect(icon: *const ICONINFO) -> HICON;
 }
 
 /// Windows colour helpers: `RGB` is just `0x00BBGGRR`.
@@ -508,6 +535,38 @@ pub const ODT_BUTTON: UINT = 4;
 pub const ODS_SELECTED: UINT = 0x0001;
 pub const ODS_DISABLED: UINT = 0x0004;
 pub const ODS_FOCUS: UINT = 0x0010;
+
+// ---- icon building --------------------------------------------------------
+
+#[repr(C)]
+pub struct BITMAPINFOHEADER {
+    pub bi_size: u32,
+    pub bi_width: i32,
+    pub bi_height: i32,
+    pub bi_planes: u16,
+    pub bi_bit_count: u16,
+    pub bi_compression: u32,
+    pub bi_size_image: u32,
+    pub bi_x_pels_per_meter: i32,
+    pub bi_y_pels_per_meter: i32,
+    pub bi_clr_used: u32,
+    pub bi_clr_important: u32,
+}
+
+#[repr(C)]
+pub struct BITMAPINFO {
+    pub bmi_header: BITMAPINFOHEADER,
+    pub bmi_colors: [u32; 1],
+}
+
+#[repr(C)]
+pub struct ICONINFO {
+    pub f_icon: BOOL,
+    pub x_hotspot: DWORD,
+    pub y_hotspot: DWORD,
+    pub hbm_mask: HBITMAP,
+    pub hbm_color: HBITMAP,
+}
 
 /// The palette a button is painted with, handed to the paint routine.
 ///

@@ -512,7 +512,11 @@ fn main() {
         wc.lpfn_wnd_proc = Some(wnd_proc);
         wc.h_instance = hinstance;
         wc.h_cursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
-        wc.h_icon = LoadIconW(std::ptr::null_mut(), 32512);
+        // A fox icon built at runtime from vector geometry — no .ico resource.
+        let fox_accent: u32 = rgb(88, 166, 255);
+        let fox_hi: u32 = rgb(130, 192, 255);
+        wc.h_icon = make_fox_icon(64, fox_accent, fox_hi);
+        wc.h_icon_sm = make_fox_icon(32, fox_accent, fox_hi);
         wc.hbr_background = CreateSolidBrush(rgb(28, 30, 34));
         wc.lpsz_class_name = class_name.as_ptr();
         if RegisterClassExW(&wc) == 0 {
@@ -548,6 +552,14 @@ fn main() {
             return;
         }
         hwnd_atomic.store(hwnd as usize as u32, Ordering::Relaxed);
+        // Push the fox icon to the window (and taskbar) explicitly. The class
+        // icon is used as a fallback, but some DWM paths only update on this.
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            ICON_BIG as usize,
+            make_fox_icon(64, fox_accent, fox_hi) as LPARAM,
+        );
 
         // Hand the reporter to the library before any work can start.
         util::set_reporter(Some(Arc::new(GuiReporter {
@@ -2306,6 +2318,128 @@ fn card(hdc: HDC, r: RECT, app: &App) {
     }
 }
 
+/// The LightFox mark — a fox-head silhouette drawn from vector geometry.
+///
+/// No image asset ships with the launcher, so the glyph is a small polygon that
+/// reads as a fox at 30 px (the header mark) and at 64 px (the taskbar icon):
+/// two pointed ears, a wide cheek, a chin, and a lighter muzzle.
+///
+/// `w`/`h` are the target box; the 0..100 normalised silhouette is scaled to fit.
+fn draw_fox(hdc: HDC, r: RECT, fill: u32, hi: u32) {
+    unsafe {
+        let w = (r.right - r.left) as f64;
+        let h = (r.bottom - r.top) as f64;
+        let px = |x: f64| r.left + (x * w / 100.0).round() as i32;
+        let py = |y: f64| r.top + (y * h / 100.0).round() as i32;
+        let pt = |x: f64, y: f64| POINT { x: px(x), y: py(y) };
+        let body = [
+            pt(12.0, 6.0), pt(27.0, 40.0), pt(37.0, 30.0), pt(50.0, 35.0),
+            pt(63.0, 30.0), pt(73.0, 40.0), pt(88.0, 6.0), pt(79.0, 52.0),
+            pt(62.0, 88.0), pt(50.0, 95.0), pt(38.0, 88.0), pt(21.0, 52.0),
+        ];
+        let brush = GetStockObject(DC_BRUSH);
+        let oldb = SelectObject(hdc, brush);
+        let pen = GetStockObject(DC_PEN);
+        let oldp = SelectObject(hdc, pen);
+        SetDCBrushColor(hdc, fill);
+        SetDCPenColor(hdc, fill);
+        Polygon(hdc, body.as_ptr(), body.len() as i32);
+        // Inner ears and muzzle, a shade brighter, so the face has depth.
+        SetDCBrushColor(hdc, hi);
+        SetDCPenColor(hdc, hi);
+        let le = [pt(17.0, 16.0), pt(26.0, 38.0), pt(31.0, 22.0)];
+        let re = [pt(83.0, 16.0), pt(74.0, 38.0), pt(69.0, 22.0)];
+        Polygon(hdc, le.as_ptr(), le.len() as i32);
+        Polygon(hdc, re.as_ptr(), re.len() as i32);
+        let mz = [pt(50.0, 60.0), pt(41.0, 87.0), pt(59.0, 87.0)];
+        Polygon(hdc, mz.as_ptr(), mz.len() as i32);
+        SelectObject(hdc, oldp);
+        SelectObject(hdc, oldb);
+    }
+}
+
+/// The silhouette alone, for the icon's transparency mask (caller sets colour).
+fn draw_fox_silhouette(hdc: HDC, r: RECT) {
+    unsafe {
+        let w = (r.right - r.left) as f64;
+        let h = (r.bottom - r.top) as f64;
+        let px = |x: f64| r.left + (x * w / 100.0).round() as i32;
+        let py = |y: f64| r.top + (y * h / 100.0).round() as i32;
+        let pt = |x: f64, y: f64| POINT { x: px(x), y: py(y) };
+        let body = [
+            pt(12.0, 6.0), pt(27.0, 40.0), pt(37.0, 30.0), pt(50.0, 35.0),
+            pt(63.0, 30.0), pt(73.0, 40.0), pt(88.0, 6.0), pt(79.0, 52.0),
+            pt(62.0, 88.0), pt(50.0, 95.0), pt(38.0, 88.0), pt(21.0, 52.0),
+        ];
+        Polygon(hdc, body.as_ptr(), body.len() as i32);
+    }
+}
+
+/// Build a transparent fox `HICON` of `size`×`size` from the same geometry.
+///
+/// Two bitmaps back it: a 32bpp colour plane (the fox) and a 1bpp mask where
+/// white = show the screen (transparent) and black = show the colour. The
+/// standard icon blend `Dest = (Dest AND Mask) XOR (Color AND NOT Mask)` makes
+/// the fox opaque and the rest see-through on the taskbar and title bar.
+///
+/// `CreateIconIndirect` does not copy the bitmaps, so they are intentionally
+/// leaked for the process lifetime — one icon, negligible cost.
+fn make_fox_icon(size: i32, fill: u32, hi: u32) -> HICON {
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        let full = RECT { left: 0, top: 0, right: size, bottom: size };
+
+        // Colour plane: a 32bpp DIB, filled black so only the fox shows.
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmi_header.bi_size = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmi_header.bi_width = size;
+        bmi.bmi_header.bi_height = -size; // top-down
+        bmi.bmi_header.bi_planes = 1;
+        bmi.bmi_header.bi_bit_count = 32;
+        bmi.bmi_header.bi_compression = BI_RGB;
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hbmp_color =
+            CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+        let mem = CreateCompatibleDC(screen);
+        let oldc = SelectObject(mem, hbmp_color as HGDIOBJ);
+        let bg = CreateSolidBrush(rgb(0, 0, 0));
+        FillRect(mem, &full, bg);
+        DeleteObject(bg as HGDIOBJ);
+        draw_fox(mem, full, fill, hi);
+        SelectObject(mem, oldc);
+        DeleteDC(mem);
+
+        // Mask plane: white everywhere, then a black fox silhouette.
+        let hbmp_mask = CreateBitmap(size, size, 1, 1, std::ptr::null());
+        let memm = CreateCompatibleDC(screen);
+        let oldm = SelectObject(memm, hbmp_mask as HGDIOBJ);
+        let w = CreateSolidBrush(0x00FF_FFFF);
+        FillRect(memm, &full, w);
+        DeleteObject(w as HGDIOBJ);
+        let pen = GetStockObject(DC_PEN);
+        let op = SelectObject(memm, pen);
+        SetDCPenColor(memm, 0);
+        let brush = GetStockObject(DC_BRUSH);
+        let ob = SelectObject(memm, brush);
+        SetDCBrushColor(memm, 0);
+        draw_fox_silhouette(memm, full);
+        SelectObject(memm, ob);
+        SelectObject(memm, op);
+        SelectObject(memm, oldm);
+        DeleteDC(memm);
+
+        ReleaseDC(std::ptr::null_mut(), screen);
+
+        CreateIconIndirect(&ICONINFO {
+            f_icon: 1,
+            x_hotspot: 0,
+            y_hotspot: 0,
+            hbm_mask: hbmp_mask,
+            hbm_color: hbmp_color,
+        })
+    }
+}
+
 /// The bold font used by section headings, published at startup.
 ///
 /// A heading is drawn on every repaint, so creating a font per call would leak
@@ -2332,23 +2466,15 @@ fn paint(app: &App) {
         SetBkMode(hdc, TRANSPARENT);
 
         // ---- header --------------------------------------------------------
-        // Brand mark: a rounded accent square, so the name has something to
-        // sit against instead of floating in the corner.
-        let mark = RECT {
-            left: PAD,
-            top: 13,
-            right: PAD + 30,
-            bottom: 41,
-        };
-        round_fill(hdc, mark, 8, app.accent, None);
-        draw_text(
-            hdc,
-            "LF",
-            RECT { left: PAD, top: 15, right: PAD + 30, bottom: 43 },
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-            app.bg,
-        );
+        // Brand mark: a fox-head silhouette, so the name has a real face instead
+        // of floating in the corner. Drawn from vector geometry — no asset ships.
         SelectObject(hdc, app.font_bold as HGDIOBJ);
+        draw_fox(
+            hdc,
+            RECT { left: PAD, top: 12, right: PAD + 32, bottom: 44 },
+            app.accent,
+            app.accent_hi,
+        );
         draw_text(
             hdc,
             "LightFox",
