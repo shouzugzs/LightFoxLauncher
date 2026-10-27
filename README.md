@@ -15,7 +15,7 @@ no login server, no runtime dependencies — just the game.
 
 | Binary | Size | What it is |
 |---|---|---|
-| `LFL-gui.exe` | **656,384 B (0.63 MiB)** | native Win32 window: pick version, click play |
+| `LFL-gui.exe` | **657,920 B (0.63 MiB)** | native Win32 window: pick version, click play |
 | `LFL.exe` | **524,800 B (0.50 MiB)** | command line, scriptable |
 
 ```

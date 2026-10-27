@@ -80,6 +80,23 @@ announcement endpoint, destructive actions scoped to files it owns.
 
 Both binaries remain under the 1 MB budget.
 
+### Fixed — Java 扫描漏掉数据盘上的 JDK
+
+The 设置 page's scan only looked for `D:\jdk` / `D:\java` / `D:\Java` — three
+literal paths. A JDK unpacked as `D:\jdk-21.0.8`, or under a hand-made parent
+like `D:\develop\Java\…`, was invisible. Now:
+
+* every fixed drive's root is scanned through the existing name filter
+  (`could_hold_jdk`) and depth bound, so `D:\jdk-25.0.1` is found while
+  `D:\Photos` costs one `stat`;
+* the name filter knows the parent folders people actually create —
+  `develop`, `dev`, `environment`, `soft`, `software`, `program`, `tool`;
+* the system drive is skipped (already covered by the `ProgramFiles` roots)
+  and removable drives present at scan time are included.
+
+Verified against a real machine with three JDKs unpacked at the D: root —
+all three now appear.
+
 ## 0.2.1
 
 ### Fixed — layout alignment

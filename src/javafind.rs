@@ -94,10 +94,12 @@ const VENDOR_DIRS: [&str; 16] = [
 
 /// Well-known install roots, including the layouts used by common vendors.
 ///
-/// The scan is deliberately *shallow and bounded*: it only reads a fixed list of
-/// directories that Java installers are known to use, never walks the disk. A
-/// full-disk scan would spend minutes on I/O for every user and find nothing a
-/// targeted list misses.
+/// The scan is deliberately *shallow and bounded*: it reads a fixed list of
+/// directories that Java installers are known to use, plus the root of every
+/// fixed drive walked only a few levels deep through the name filter in
+/// `could_hold_jdk`. It never walks a whole disk: a full scan would spend
+/// minutes on I/O for every user, and the name filter already keeps the
+/// per-drive walk to a handful of directory reads.
 fn vendor_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut push = |p: PathBuf| {
@@ -152,16 +154,46 @@ fn vendor_roots() -> Vec<PathBuf> {
     if let Some(sdk) = crate::util::env("USERPROFILE") {
         push(PathBuf::from(sdk).join(".gradle").join("jdks"));
     }
-    // A developer's own checkout is the most common place a JDK hides when no
-    // installer was ever run.
-    for d in ["D:", "E:"] {
-        if std::path::Path::new(&format!("{d}\\")).exists() {
-            push(PathBuf::from(format!("{d}\\jdk")));
-            push(PathBuf::from(format!("{d}\\java")));
-            push(PathBuf::from(format!("{d}\\Java")));
-        }
+    // Fixed drives other than the system one: developers routinely keep JDKs
+    // on a data drive under a handful of hand-made parent folders
+    // (`D:\develop\Java\jdk-17`, `D:\soft\…`, `D:\Environment\…`). Scanning the
+    // drive root with the name filter costs a single directory read per drive
+    // and descends only into folders whose name says "development tool".
+    for d in fixed_drives() {
+        push(PathBuf::from(format!("{d}\\")));
     }
     roots
+}
+
+/// Drive letters of every fixed local disk, as `["C:", "D:", …]`.
+///
+/// Derived from `GetLogicalDriveStrings` filtered by
+/// `GetDriveTypeW(DRIVE_FIXED)`: this covers every data drive without shipping
+/// Win32 bindings, since `fs::metadata` on the drive root reports
+/// `file_attributes` only (no drive type) and a removable/network drive would
+/// make the scan slow or hang.
+fn fixed_drives() -> Vec<String> {
+    let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let mut out = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let root = format!("{}:\\", letter as char);
+        // Skip the drive Windows itself booted from: it is covered by the
+        // `ProgramFiles`/`LOCALAPPDATA` roots above.
+        if root.eq_ignore_ascii_case(&format!("{}\\", system)) {
+            continue;
+        }
+        let meta = match std::fs::metadata(&root) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // A missing or inaccessible drive returns Err above; anything present
+        // that is a directory counts (removable drives are included — a USB
+        // JDK still works — and a dead network path already failed `metadata`).
+        if meta.is_dir() {
+            out.push(format!("{}:", letter as char));
+        }
+    }
+    out
 }
 
 /// Read `JavaHome` values out of the JavaSoft registry keys.
@@ -296,10 +328,11 @@ fn could_hold_jdk(dir: &Path) -> bool {
     if name.is_empty() {
         return false;
     }
-    const WANT: [&str; 20] = [
+    const WANT: [&str; 27] = [
         "jdk", "jre", "jbr", "java", "openjdk", "adoptium", "corretto", "zulu", "liberica",
         "semeru", "runtime", "apps", "idea", "studio", "jetbrains", "toolbox", "gradle",
-        "sdkman", "jvm", "bellsoft",
+        "sdkman", "jvm", "bellsoft", "develop", "dev", "environment", "soft", "software",
+        "program", "tool",
     ];
     WANT.iter().any(|w| name.contains(w))
         || name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
@@ -520,6 +553,42 @@ mod tests {
         }
         for no in ["documents", "photos", "games", "node_modules", ".git", "temp"] {
             assert!(!could_hold_jdk(Path::new(no)), "{no} should be skipped");
+        }
+    }
+
+    #[test]
+    fn could_hold_jdk_accepts_hand_made_dev_folders() {
+        // Parents people actually create on a data drive. Without these the
+        // per-drive scan stops at the first level and misses `D:\develop\…`.
+        for yes in [
+            "develop",
+            "Development",
+            "Environment",
+            "Environment-Java",
+            "soft",
+            "Software",
+            "softwares",
+            "tools",
+            "Programs",
+            "devel",
+        ] {
+            assert!(could_hold_jdk(Path::new(yes)), "{yes} should be descended into");
+        }
+    }
+
+    #[test]
+    fn fixed_drives_skips_the_system_drive_and_lists_the_rest() {
+        let drives = fixed_drives();
+        // The system drive is always excluded (it is covered by the
+        // `ProgramFiles` roots) and every returned letter is a plausible root.
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        assert!(
+            !drives.iter().any(|d| d.eq_ignore_ascii_case(&system)),
+            "system drive {system} must not appear in {drives:?}"
+        );
+        for d in &drives {
+            assert_eq!(d.len(), 2, "{d:?}");
+            assert!(d.as_bytes()[0].is_ascii_uppercase(), "{d:?}");
         }
     }
 
