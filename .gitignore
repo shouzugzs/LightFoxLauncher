@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# Released binaries are attached to GitHub Releases, not the repo
+/dist/
+
+# Launcher data directory (created next to the exe at runtime)
+/.minecraft/
+
+# Local scratch
+*.log
+*.png

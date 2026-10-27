@@ -1,0 +1,32 @@
+[package]
+name = "lightfox"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.95"
+description = "LightFoxLauncher — a tiny zero-dependency Minecraft launcher with native Win32 GUI and CLI front-ends"
+license = "MPL-2.0"
+repository = "https://github.com/LightFoxLauncher/LightFoxLauncher"
+readme = "README.md"
+keywords = ["minecraft", "launcher", "win32", "zero-dependency"]
+categories = ["games"]
+
+[lib]
+name = "lightfox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "LFL"
+path = "src/main.rs"
+
+[[bin]]
+name = "LFL-gui"
+path = "src/gui/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
