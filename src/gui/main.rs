@@ -16,7 +16,7 @@ mod win32;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use lightfox::launcher::{self, Options};
 use lightfox::settings::Settings;
@@ -25,6 +25,35 @@ use lightfox::version;
 use lightfox::{java, BRAND, TITLE, VERSION};
 
 use win32::*;
+
+/// The main window handle, published so a background download thread can pop an
+/// advisory message box (e.g. for an unverified download) without threading the
+/// HWND through every call site. `0` until the window exists.
+static WINDOW_HWND: OnceLock<Arc<AtomicU32>> = OnceLock::new();
+
+fn window_hwnd() -> u32 {
+    WINDOW_HWND
+        .get()
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Advisory pop-up for non-fatal warnings (unverified downloads, etc.).
+struct GuiWarn;
+
+impl util::Warn for GuiWarn {
+    fn warn(&self, msg: &str) {
+        let hwnd = window_hwnd();
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            let cap = wide("LightFox 提示");
+            let body = wide(msg);
+            MessageBoxW(hwnd as HWND, body.as_ptr(), cap.as_ptr(), MB_OK | MB_ICONINFORMATION);
+        }
+    }
+}
 
 // ---- control ids -----------------------------------------------------------
 
@@ -500,7 +529,7 @@ impl Reporter for GuiReporter {
 
 fn main() {
     init_common_controls();
-    let hwnd_atomic = Arc::new(AtomicU32::new(0));
+    let hwnd_atomic = WINDOW_HWND.get_or_init(|| Arc::new(AtomicU32::new(0)));
     let app = Box::new(App::new());
     let app_ptr = Box::into_raw(app);
 
@@ -567,6 +596,8 @@ fn main() {
             prog: (*app_ptr).prog.clone(),
             hwnd: hwnd_atomic.clone(),
         })));
+        // And the advisory warning sink (used for unverified downloads).
+        util::set_warner(Some(Arc::new(GuiWarn)));
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);

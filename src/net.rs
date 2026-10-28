@@ -848,6 +848,20 @@ fn download_inner(url: &str, dest: &Path, sha1: &str, size: u64, prog: &Prog) ->
         return Ok(());
     }
 
+    // An empty checksum means we can only trust the byte count, not the contents.
+    // That is not fatal (the caller may still want the file), but the user should
+    // be told once rather than silently trusting an unverified download.
+    if sha1.is_empty() {
+        static WARMED: OnceLock<AtomicBool> = OnceLock::new();
+        let flag = WARMED.get_or_init(|| AtomicBool::new(false));
+        if !flag.swap(true, Ordering::Relaxed) {
+            util::warn(&format!(
+                "正在下载未经校验和验证的文件（{}）。只校验大小，无法确认内容完整性，请谨慎使用。",
+                dest.display()
+            ));
+        }
+    }
+
     // One process per destination file. Another launcher transferring this exact
     // file produces the same bytes, so rather than queueing we wait for its
     // result: re-check the destination, and if it finished while we waited we are

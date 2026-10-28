@@ -56,6 +56,45 @@ pub fn quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
 }
 
+/// A non-fatal warning sink (e.g. a GUI message box). Unlike [`Reporter`], which
+/// carries progress, this is for a single advisory line the user should see but
+/// which must not abort the operation — such as "downloading without a checksum".
+///
+/// The CLI leaves this unset and warnings fall back to `eprintln!`.
+pub trait Warn: Send + Sync {
+    fn warn(&self, msg: &str);
+}
+
+static WARNER: OnceLock<Mutex<Option<Arc<dyn Warn>>>> = OnceLock::new();
+
+fn warner_cell() -> &'static Mutex<Option<Arc<dyn Warn>>> {
+    WARNER.get_or_init(|| Mutex::new(None))
+}
+
+/// Install (or clear) the global warning sink. Safe to call from any thread.
+pub fn set_warner(w: Option<Arc<dyn Warn>>) {
+    if let Ok(mut g) = warner_cell().lock() {
+        *g = w;
+    }
+}
+
+/// Emit a non-fatal warning. No-op when no sink is installed (the CLI path),
+/// where the caller is expected to log it instead.
+pub fn warn(msg: &str) {
+    match warner_cell().lock() {
+        Ok(g) => {
+            if let Some(w) = g.as_ref() {
+                w.warn(msg);
+            }
+        }
+        Err(p) => {
+            if let Some(w) = p.into_inner().as_ref() {
+                w.warn(msg);
+            }
+        }
+    }
+}
+
 /// Print a progress/status line unless `--quiet`. Also forwards to the reporter.
 pub fn info(msg: &str) {
     if let Some(r) = reporter() {
