@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1
+
+Bugfix/UX follow-up to the security-audit hardening.
+
+### Changed
+
+* **Downloads without a checksum no longer abort.** When a file's `sha1` is empty
+  the launcher only verifies byte size. Previously this was a hard failure; it now
+  shows an advisory message box (once per run) and continues, so offline/optional
+  content still downloads. CLI is unaffected — the warning is a no-op without a GUI.
+
 ## 0.3.0
 
 The 通知 page, the two security audit rounds, and the open-source paperwork.
