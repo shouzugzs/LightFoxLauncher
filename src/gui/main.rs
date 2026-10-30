@@ -607,6 +607,14 @@ fn main() {
         UpdateWindow(hwnd);
         SetTimer(hwnd, TIMER_UI, 200, std::ptr::null_mut());
 
+        // The one-time "enable announcements?" question, asked here rather than
+        // in `WM_CREATE` so it appears over a window that is already visible and
+        // themed. It is a plain modal message box, so it blocks before the
+        // message loop starts — there is no half-initialised UI for the user to
+        // click through while it is up.
+        notify_first_run(&mut *app_ptr);
+        notify_reseed(&*app_ptr);
+
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
@@ -1756,7 +1764,19 @@ fn build_controls(app: &mut App) {
     }
 
     // ---- seed fields from settings + command line --------------------------
-    let dir = Options::default().data_dir();
+    //
+    // The settings file lives in the **data directory**, and `--dir` chooses that
+    // directory — so the CLI has to be parsed *before* the file is read. Loading
+    // from `Options::default()` and then overwriting the box with `--dir` (which
+    // is what this used to do) read the settings from one directory and saved
+    // them to another: the user's answer to the first-run question was written
+    // to the `--dir` location, read back from the default one, and the question
+    // was therefore asked again on every start.
+    let cli = CliArgs::parse();
+    let dir = match &cli.dir {
+        Some(d) => d.clone(),
+        None => Options::default().data_dir(),
+    };
     app.settings = Settings::load_and_apply(&dir);
     unsafe {
         let dw = wide(&dir.display().to_string());
@@ -1774,13 +1794,6 @@ fn build_controls(app: &mut App) {
         refresh_worker_note(app);
     }
 
-    let cli = CliArgs::parse();
-    if let Some(d) = &cli.dir {
-        unsafe {
-            let dw = wide(&d.display().to_string());
-            SetWindowTextW(app.dir_edit, dw.as_ptr());
-        }
-    }
     if let Some(u) = &cli.user {
         unsafe {
             let uw = wide(u);
@@ -3171,6 +3184,9 @@ fn save_settings(app: &mut App) {
         // 设置 page must not silently clear the configured feed URL.
         feed_url: app.settings.feed_url.clone(),
         check_feed: app.settings.check_feed,
+        // Also owned by the 通知 page. Preserved rather than defaulted, or a
+        // 设置-page save would reset the one-time consent and re-ask next start.
+        feed_prompted: app.settings.feed_prompted,
     };
     if let Err(e) = new.validate() {
         app.message("设置无效", &e);
@@ -5076,6 +5092,11 @@ fn notify_save_auto(app: &mut App) {
     let want = notify_auto_checked(app);
     let mut s = app.settings.clone();
     s.check_feed = want;
+    // Toggling the switch is itself an answer, so the one-time question is
+    // spent either way. Set explicitly rather than relying on the clone, so a
+    // build that predates `feed_prompted` (file has no such key) cannot end up
+    // asking the user again after they have just used the switch.
+    s.feed_prompted = true;
     // Keep the URL in sync with the box, so the two controls cannot disagree.
     let url = notify_url_text(app);
     s.feed_url = if url.is_empty() { None } else { Some(url) };
@@ -5130,8 +5151,99 @@ fn notify_startup(app: &mut App) {
             notify_fetch(app, url, true);
         }
         _ => {
-            set_notify_status(app, "填写通知地址后点“检查更新”；留空即关闭此功能。");
+            set_notify_status(app, notify_idle_hint(app));
         }
+    }
+}
+
+/// Push `app.settings` back into the 通知 page's controls.
+///
+/// Needed after [`notify_first_run`], which runs *after* [`notify_startup`] (the
+/// dialog must not appear during `WM_CREATE`, when the window is not visible
+/// yet) and can change `check_feed`. Without this the checkbox would keep
+/// showing the pre-answer state until the next start.
+fn notify_reseed(app: &App) {
+    unsafe {
+        SendMessageW(
+            app.notify_auto,
+            BM_SETCHECK,
+            if app.settings.check_feed {
+                BST_CHECKED as WPARAM
+            } else {
+                BST_UNCHECKED as WPARAM
+            },
+            0,
+        );
+    }
+}
+
+/// Status line for the idle state, which depends on whether the feature is on.
+fn notify_idle_hint(app: &App) -> &'static str {
+    if app.settings.check_feed {
+        "填写通知地址后点“检查更新”；留空即关闭此功能。"
+    } else {
+        "通知接收已关闭。勾选“启动时自动检查”并填写地址即可重新启用。"
+    }
+}
+
+/// Ask once, on the first run, whether the user wants announcements at all.
+///
+/// The launcher ships with the feature **off** and no endpoint, so there is
+/// nothing to enable silently: this question only decides whether the 通知 page
+/// should be offered as active, and records that the question is spent. It
+/// never contacts the network — with no URL configured there is nothing to
+/// contact, which is exactly why "yes" here does not produce any request.
+///
+/// `feed_prompted` is what makes this a *one-time* question. `check_feed` alone
+/// cannot carry that meaning: the user is free to turn the switch off later, and
+/// the launcher must not re-ask on the next start because of it. The answer is
+/// persisted immediately, so a crash right after the dialog does not re-ask.
+fn notify_first_run(app: &mut App) {
+    if app.settings.feed_prompted {
+        return;
+    }
+    // Default the dialog to "no": pressing Enter or Escape must not enable a
+    // network feature. `MB_DEFBUTTON2` puts the default on 否.
+    let text = wide(
+        "是否启用通知接收？\n\n\
+         启用后，LightFoxLauncher 可以在“通知”页显示公告，并在有新版本时提示你。\n\n\
+         · 本启动器不内置任何通知服务器，不会向你未指定的地址发送请求；\n\
+         · 你需要自己在“通知”页填写一个返回 JSON 的地址，功能才会工作；\n\
+         · 随时可以在该页关闭，或直接清空地址。\n\n\
+         现在启用吗？",
+    );
+    let cap = wide("LightFoxLauncher 提示");
+    let answer = unsafe {
+        MessageBoxW(
+            app.hwnd,
+            text.as_ptr(),
+            cap.as_ptr(),
+            MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2,
+        )
+    };
+    let want = answer == IDYES as i32;
+    let mut s = app.settings.clone();
+    s.check_feed = want;
+    // Mark it asked whatever the answer, so "no" is respected permanently.
+    s.feed_prompted = true;
+    match s.save(&notify_dir(app)) {
+        Ok(()) => app.settings = s,
+        Err(e) => {
+            // Persisting failed, so the question would come back next start.
+            // Keep the in-memory answer (the page should still behave as
+            // chosen) but say why the choice will not stick.
+            app.settings = s;
+            set_notify_status(app, &format!("无法保存通知设置：{e}"));
+            return;
+        }
+    }
+    if want {
+        set_notify_status(
+            app,
+            "已启用通知接收。请在上面填写通知地址（一个返回 JSON 的 URL）。",
+        );
+    } else {
+        set_notify_status(app, "已保持关闭。之后想用可在本页勾选“启动时自动检查”。");
     }
 }
 

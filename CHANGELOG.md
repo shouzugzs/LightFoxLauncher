@@ -6,6 +6,39 @@ Security round 3, aimed at one feature end to end: the 通知 page and the
 startup update check. Seven findings, all fixed or documented, each with a
 regression test. Full write-up in [docs/SECURITY-ROUND3.md](docs/SECURITY-ROUND3.md).
 
+Plus a first-run consent question for announcements, and a data-directory bug
+that question exposed.
+
+### Added
+
+* **First start asks once whether to enable announcement reception.** The
+  default button is 否, and the answer is remembered in a new
+  `lfl-settings.ini` key, `feed_prompted`, so the question never reappears.
+  `feed_prompted` is deliberately separate from `check_feed`: the latter is the
+  live switch the user can flip freely, the former records only that the
+  question is spent — without it the launcher cannot tell "the user said no"
+  from "the user has never been asked".
+* There is still **no built-in endpoint**. Answering yes contacts nothing;
+  the URL remains something the user must fill in on the 通知 page. That is the
+  whole point of asking rather than defaulting the feature on.
+* The 通知 page's idle status line now reflects the switch: with the feature off
+  it says so, instead of always prompting for a URL.
+
+### Fixed
+
+* **The GUI read settings from one directory and wrote them to another.** It
+  loaded `lfl-settings.ini` from the default data directory and then pointed the
+  game-directory box at `--dir`, while every save went to `--dir`. So with
+  `--dir` set, preferences were never read back — the new first-run question
+  was asked again on every single start, and any other setting saved from the
+  设置 page was silently ignored on the next launch. The CLI is now parsed
+  *before* the settings are loaded, and both sides use the same directory.
+* An existing `feed_url` in a pre-0.3.2 settings file counts as "already opted
+  in", so upgrading users are not asked a question about a feature they are
+  demonstrably using.
+* Toggling 启动时自动检查 marks the consent question answered, so a settings file
+  written by an older build cannot cause a re-ask after the switch was used.
+
 ### Fixed — security round 3
 
 * **N1 Medium — oversized feed buffered before the size check.** `fetch` read the

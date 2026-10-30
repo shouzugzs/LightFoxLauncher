@@ -231,6 +231,9 @@ pub const MB_ICONERROR: UINT = 0x0000_0010;
 pub const MB_ICONINFORMATION: UINT = 0x0000_0040;
 pub const MB_OK: UINT = 0x0000_0000;
 pub const MB_YESNO: UINT = 0x0000_0004;
+/// Put the focus and the Enter key on the **second** button (否 in a YESNO box).
+/// Used for consent prompts where the safe answer must be the default.
+pub const MB_DEFBUTTON2: UINT = 0x0000_0100;
 pub const IDYES: isize = 6;
 
 pub const DT_LEFT: UINT = 0x0000;

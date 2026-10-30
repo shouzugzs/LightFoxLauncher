@@ -24,13 +24,20 @@ two separate.
 * **No Microsoft authentication exists.** The launcher passes
   `auth_access_token` as the literal string `"0"` — there are no credentials
   to store, leak, or transmit. Offline mode only.
-* **The announcement feed is off by default.** With no URL configured, the
-  launcher performs exactly zero network requests at startup beyond the version
-  manifest, which itself is cached for 30 minutes and replaced by a built-in
-  fallback list when offline.
+* **The announcement feed is off by default, and asks once.** On the first
+  start the launcher asks whether you want to receive announcements at all;
+  the default answer is 否, and the answer is remembered so you are not asked
+  again. There is **no built-in endpoint** — saying yes does not contact
+  anything, because there is no address to contact until you fill one in
+  yourself on the 通知 page. With no URL configured the launcher performs
+  exactly zero network requests at startup beyond the version manifest, which
+  itself is cached for 30 minutes and replaced by a built-in fallback list when
+  offline. You can turn the feature off at any time with the same checkbox, or
+  by clearing the URL.
 * What it writes stays next to the executable: `.minecraft/` (the game data),
-  `lfl-settings.ini` (your preferences), `lfl-seen.ini` (which announcements
-  you have read). None of it leaves the machine.
+  `lfl-settings.ini` (your preferences, including the feed on/off state and
+  whether the one-time question has been answered), `lfl-seen.ini` (which
+  announcements you have read). None of it leaves the machine.
 
 ## For the maintainer
 

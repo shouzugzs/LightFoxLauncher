@@ -53,6 +53,16 @@ pub struct Settings {
     pub feed_url: Option<String>,
     /// Check the feed automatically on start.
     pub check_feed: bool,
+    /// Whether the first-run "do you want announcements?" question has been
+    /// asked and answered.
+    ///
+    /// This is separate from [`Settings::check_feed`] on purpose. `check_feed`
+    /// is the *current* state of the switch and the user can flip it any number
+    /// of times; `feed_prompted` records only that the one-time question is
+    /// spent. Without it the launcher cannot tell "the user said no" from "the
+    /// user has never been asked", and would either nag on every start or never
+    /// ask at all.
+    pub feed_prompted: bool,
 }
 
 impl Default for Settings {
@@ -66,8 +76,9 @@ impl Default for Settings {
             resume: true,
             progress: true,
             feed_url: None,
-            // Off until a URL is configured: no URL, nothing to check.
-            check_feed: true,
+            // Off until the user is asked once and says yes; see `feed_prompted`.
+            check_feed: false,
+            feed_prompted: false,
         }
     }
 }
@@ -85,6 +96,11 @@ impl Settings {
             Ok(t) => t,
             Err(_) => return out,
         };
+        // Tracked for the pre-0.3.2 migration below: whether the file said
+        // anything about the consent question, and whether it already had a
+        // feed URL configured.
+        let mut saw_prompted = false;
+        let mut saw_feed_url = false;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -103,10 +119,29 @@ impl Settings {
                 "instance" if !v.is_empty() => out.instance = v.to_string(),
                 "resume" => out.resume = v != "0",
                 "progress" => out.progress = v != "0",
-                "feed_url" if !v.is_empty() => out.feed_url = Some(v.to_string()),
+                "feed_url" if !v.is_empty() => {
+                    out.feed_url = Some(v.to_string());
+                    saw_feed_url = true;
+                }
                 "check_feed" => out.check_feed = v != "0",
+                "feed_prompted" => {
+                    out.feed_prompted = v != "0";
+                    saw_prompted = true;
+                }
                 _ => {}
             }
+        }
+        // Migration for files written before 0.3.2, which have no
+        // `feed_prompted` key. A user who already configured a feed URL has
+        // plainly opted in — asking them "do you want announcements?" on the
+        // first start after upgrading would be both confusing and a regression,
+        // since the feature is already in use. Treat that as answered.
+        //
+        // A file with no URL and no key is a genuinely fresh install (or one
+        // where the user never touched the page), so it stays unasked and the
+        // first-run question appears.
+        if !saw_prompted && saw_feed_url {
+            out.feed_prompted = true;
         }
         out
     }
@@ -130,7 +165,8 @@ impl Settings {
              resume={}\n\
              progress={}\n\
              feed_url={}\n\
-             check_feed={}\n",
+             check_feed={}\n\
+             feed_prompted={}\n",
             self.workers,
             one_line(&self.java.clone().unwrap_or_default()),
             one_line(&self.memory),
@@ -140,6 +176,7 @@ impl Settings {
             self.progress as u8,
             one_line(&self.feed_url.clone().unwrap_or_default()),
             self.check_feed as u8,
+            self.feed_prompted as u8,
         );
         let target = Settings::file(dir);
         let tmp = dir.join("lfl-settings.ini.tmp");
@@ -255,9 +292,84 @@ mod tests {
             progress: true,
             feed_url: Some("https://example.invalid/feed.json".to_string()),
             check_feed: false,
+            feed_prompted: true,
         };
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_consent_question_is_asked_once() {
+        // `feed_prompted` is what distinguishes "the user said no" from "the
+        // user has never been asked". Defaults must be unasked, and both
+        // answers must round-trip — otherwise the dialog either nags on every
+        // start or never appears.
+        let d = Settings::default();
+        assert!(!d.feed_prompted, "a fresh install has not been asked yet");
+        assert!(!d.check_feed, "the feature starts off");
+        assert_eq!(d.feed_url, None, "there is no built-in endpoint");
+
+        let dir = temp("consent");
+        // Answer: yes.
+        let mut s = Settings::default();
+        s.feed_prompted = true;
+        s.check_feed = true;
+        s.save(&dir).unwrap();
+        let back = Settings::load(&dir);
+        assert!(back.feed_prompted);
+        assert!(back.check_feed);
+        // Answer: no — must be remembered as answered, and stay off.
+        let mut s2 = Settings::default();
+        s2.feed_prompted = true;
+        s2.check_feed = false;
+        s2.save(&dir).unwrap();
+        let back2 = Settings::load(&dir);
+        assert!(back2.feed_prompted, "saying no still spends the question");
+        assert!(!back2.check_feed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_settings_file_is_treated_as_unasked() {
+        // A file written before 0.3.2 has no `feed_prompted` key. One that
+        // never configured a feed is a fresh install and must be asked.
+        let dir = temp("oldini");
+        std::fs::write(
+            Settings::file(&dir),
+            "workers=8\nuser=Alex\ncheck_feed=1\n",
+        )
+        .unwrap();
+        let s = Settings::load(&dir);
+        assert!(!s.feed_prompted, "missing key, no URL -> unasked");
+        assert_eq!(s.user, "Alex");
+        assert_eq!(s.feed_url, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_upgraded_file_that_already_has_a_feed_is_not_asked_again() {
+        // The migration that matters: a 0.3.1 user who configured a feed has
+        // already opted in. Asking them on the first start after upgrading
+        // would be a regression — the feature is demonstrably in use.
+        let dir = temp("upgrade");
+        std::fs::write(
+            Settings::file(&dir),
+            "workers=8\nuser=Alex\nfeed_url=https://h/f\ncheck_feed=1\n",
+        )
+        .unwrap();
+        let s = Settings::load(&dir);
+        assert!(s.feed_prompted, "an existing feed URL counts as opted in");
+        assert_eq!(s.feed_url.as_deref(), Some("https://h/f"));
+        assert!(s.check_feed);
+        // An explicit `feed_prompted=0` wins over the migration: a file that
+        // says "not answered" was written by a build that knows the key.
+        std::fs::write(
+            Settings::file(&dir),
+            "feed_url=https://h/f\nfeed_prompted=0\n",
+        )
+        .unwrap();
+        assert!(!Settings::load(&dir).feed_prompted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
