@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.3.2
+
+Security round 3, aimed at one feature end to end: the 通知 page and the
+startup update check. Seven findings, all fixed or documented, each with a
+regression test. Full write-up in [docs/SECURITY-ROUND3.md](docs/SECURITY-ROUND3.md).
+
+### Fixed — security round 3
+
+* **N1 Medium — oversized feed buffered before the size check.** `fetch` read the
+  whole response with no bound and only then compared it against the 256 KiB cap,
+  so a hostile endpoint could make the launcher allocate anything. The limit is
+  now a parameter of the read loop (`net::get_max`) and is enforced per chunk.
+* **N2 Medium — a trickling server wedges 检查更新 for the whole session.** The
+  `feed_busy` flag is cleared only when the worker reports back; WinHTTP's receive
+  timeout restarts on every read, so a slowloris kept the button dead forever. A
+  60 s total deadline now bounds the read, and a 90 s UI-side grace period
+  (`feed_unwedge`) rescues a worker that vanished without reporting.
+* **N3 Medium — bidi and zero-width characters spoof announcement text.**
+  `char::is_control` covers category Cc only, so `U+202E` (which reverses
+  rendering) and `U+200B` (invisible, so two notes can look identical while
+  carrying different ids) reached the list box and the state file. Both are now
+  dropped, while CJK and emoji still pass.
+* **N4 Medium — CR/LF in a document-supplied URL reached the request line.** The
+  path becomes the request target of `GET <path> HTTP/1.1`, so a newline in it
+  split the request and let the remainder parse as headers. Download URLs come
+  from remote version JSON and the Modrinth API, and JSON escapes carry `\r\n`
+  verbatim. Refused in `Url::parse` *and* again in `Session::open_with`, since
+  `Url`'s fields are public.
+* **N5 Low — plaintext `http://` feed accepted silently.** A network attacker
+  could rewrite announcements, including the "new version" hint. Now warns once
+  (CLI unaffected); still not blocked, following the same advisory policy as the
+  unverified-download warning.
+* **N6 Low — `reported_update` was written but never read**, so the same update
+  was announced on every start despite the comment saying otherwise. It is now
+  compared against, and a repeat is shown as 可更新到 rather than 有新版本.
+
+### Also changed
+
+* `Settings::save` flattens every value onto one line, so a hand-edited
+  `lfl-settings.ini` cannot forge a second `key=value` line — the same defence
+  `lfl-seen.ini` already had.
+* The `User-Agent` is now built from the crate version instead of a hard-coded
+  `LFL/0.1`, which had been stale since 0.1.
+* `net::MAX_DOC` (64 MiB) caps every metadata document, and `get`/`get_opt`
+  share a 60 s read deadline.
+
 ## 0.3.1
 
 Bugfix/UX follow-up to the security-audit hardening.

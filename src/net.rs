@@ -105,7 +105,41 @@ const ERROR_WINHTTP_CONNECTION_ERROR: u32 = 12030;
 const ERROR_WINHTTP_TIMEOUT: u32 = 12002;
 
 /// User agent for every request.
-const AGENT: &str = "LFL/0.1";
+///
+/// Built from the crate version rather than a literal: the old `"LFL/0.1"`
+/// still said `0.1` at release `0.3.1`, so an endpoint operator could not tell
+/// builds apart — or notice that an ancient one was still calling.
+const AGENT: &str = concat!("LFL/", env!("CARGO_PKG_VERSION"));
+
+/// Largest document [`get`] / [`get_opt`] will buffer, in bytes.
+///
+/// The cap is enforced **while reading**, not afterwards. Callers used to check
+/// the body length only once the whole thing was in memory, so a hostile or
+/// compromised document host could hand back gigabytes and the process died on
+/// the allocation instead of on the check.
+///
+/// 64 MiB is deliberately generous: the biggest legitimate document is an
+/// `assets/indexes/<id>.json` for a large modpack, which can reach tens of
+/// megabytes. Refusing those would break real installs, while a bound this far
+/// above the real maximum still turns an unbounded-allocation DoS into a clean
+/// error. Callers with a genuinely small document pass their own, tighter limit
+/// through [`get_max`].
+pub const MAX_DOC: usize = 64 * 1024 * 1024;
+
+/// Substring present in the error [`get_max`] returns when a response exceeds
+/// its cap. Callers match on this so they can report the limit in their own
+/// words instead of echoing a generic `net:` message.
+pub const TOO_LARGE: &str = "document exceeds the size cap";
+
+/// Total wall-clock budget for reading one small document.
+///
+/// [`get`] and [`get_opt`] are used for metadata a caller is *waiting* on, and
+/// some callers hold a busy flag for the whole call. WinHTTP's own receive
+/// timeout restarts on each successful read, so a server that trickles bytes
+/// keeps the read alive forever; this deadline is what actually bounds it.
+/// 60 s is far beyond any legitimate metadata fetch and short enough that a
+/// wedged fetch is recoverable.
+const DOC_DEADLINE: Duration = Duration::from_secs(60);
 /// Streaming chunk (contract: 256 KiB).
 const CHUNK: usize = 256 * 1024;
 /// Total attempts per file (contract: 3).
@@ -249,6 +283,14 @@ impl Url {
         {
             return Err(format!("net: invalid URL '{url}': bad character in host"));
         }
+        // Any other control byte (CR, LF, NUL, …) in the host would be handed to
+        // `WinHttpConnect` as a wide string; refuse it here rather than rely on
+        // WinHTTP's own validation, which differs between versions.
+        if host.chars().any(|c| c.is_control()) {
+            return Err(format!(
+                "net: invalid URL '{url}': control character in host"
+            ));
+        }
 
         let port = match port_str {
             None | Some("") => {
@@ -269,6 +311,20 @@ impl Url {
         // Fragments are never sent.
         if let Some(i) = tail.find('#') {
             tail = &tail[..i];
+        }
+        // The path becomes the **request target** of the request line:
+        // `GET <path> HTTP/1.1`. A CR or LF in it would therefore terminate the
+        // line early and let whatever follows be parsed as a header — request
+        // splitting. Every URL here can come from a remote document (a version
+        // JSON's `downloads.client.url`, a Modrinth `files[].url`), and JSON
+        // string escapes happily carry `\r\n`, so this is reachable input, not a
+        // theoretical one. WinHTTP usually rejects such a request, but "usually"
+        // is the wrong guarantee for a header-injection primitive; refuse it
+        // here, along with every other control character and space.
+        if tail.chars().any(|c| c.is_control() || c == ' ') {
+            return Err(format!(
+                "net: invalid URL '{url}': control character or space in path"
+            ));
         }
         let path = if tail.is_empty() {
             "/".to_string()
@@ -485,6 +541,30 @@ impl Session {
 
     /// Same as [`Session::open`], adding raw request headers (e.g. `Range`).
     fn open_with(url: &Url, headers: Option<&str>) -> Res<Session> {
+        // Defence in depth. `Url::parse` already refuses a control character in
+        // host or path, but `Url`'s fields are `pub`, so a caller (or a future
+        // refactor) can build one directly and hand it here. Both values end up
+        // in the request line, where a CR/LF splits the request and lets the
+        // remainder be read as headers. Re-check at the point of use, which is
+        // the only place that actually matters.
+        if url.host.chars().any(|c| c.is_control() || c == ' ' || c == '/')
+            || url.path.chars().any(|c| c.is_control() || c == ' ')
+        {
+            return Err(format!(
+                "net: refusing to send a request with a control character in {}{}",
+                url.host, url.path
+            ));
+        }
+        if let Some(h) = headers {
+            // A header string is passed to `WinHttpSendRequest` verbatim; the
+            // only caller builds `Range: bytes=N-` plus one CRLF, so strip that
+            // terminator and require the rest to be a single control-free line.
+            // Anything else is a bug worth stopping rather than sending.
+            let body = h.strip_suffix("\r\n").unwrap_or(h);
+            if body.chars().any(|c| c.is_control()) {
+                return Err("net: refusing to send malformed request headers".to_string());
+            }
+        }
         let agent = util::to_wide(AGENT);
         let mut session = unsafe {
             WinHttpOpen(
@@ -640,10 +720,29 @@ impl Session {
     }
 
     /// Read the whole body. Only used for small metadata documents.
-    fn read_all(&self) -> Res<Vec<u8>> {
+    ///
+    /// `limit` is enforced per chunk, so an oversized response is abandoned
+    /// while it is still arriving rather than after it is already in memory.
+    ///
+    /// `deadline`, when set, bounds the **total** time spent reading. A
+    /// per-operation timeout is not enough here: WinHTTP's receive timeout
+    /// restarts on every successful read, so a server that sends one byte every
+    /// few seconds (slowloris) keeps a read alive indefinitely. For the
+    /// announcement feed that matters, because the fetch holds `feed_busy` for
+    /// its whole duration — one such host would wedge the 检查更新 button for the
+    /// rest of the session, and the startup check would hold a thread forever.
+    fn read_all(&self, limit: usize, deadline: Option<Instant>) -> Res<Vec<u8>> {
         let mut out: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; CHUNK];
         loop {
+            if let Some(d) = deadline {
+                if Instant::now() >= d {
+                    return Err(format!(
+                        "net: response not complete after {}s (abandoned)",
+                        DOC_DEADLINE.as_secs()
+                    ));
+                }
+            }
             let mut avail: u32 = 0;
             if unsafe { WinHttpQueryDataAvailable(self.request.0, &mut avail) } == 0 {
                 return Err(format!(
@@ -674,6 +773,13 @@ impl Session {
                 return Ok(out);
             }
             out.extend_from_slice(&buf[..got as usize]);
+            // Check after appending so `out.len()` reflects what was really
+            // received; `avail` is only a hint and may be zero-lying or huge.
+            if out.len() > limit {
+                return Err(format!(
+                    "net: {TOO_LARGE} (more than {limit} bytes; refused)"
+                ));
+            }
         }
     }
 }
@@ -704,12 +810,23 @@ fn open_with_status(url: &Url) -> Res<(Session, u32)> {
 
 /// GET a small document. 2xx returns the body; anything else is an error.
 pub fn get(url: &str) -> Res<Vec<u8>> {
+    get_max(url, MAX_DOC)
+}
+
+/// [`get`] with an explicit size cap, enforced while the body arrives.
+///
+/// A caller that knows its document is small (an announcement feed is a few KB)
+/// should pass its own limit instead of relying on [`MAX_DOC`]: the cap is then
+/// reached long before the default one, so a hostile host costs the launcher
+/// kilobytes of memory rather than megabytes.
+pub fn get_max(url: &str, limit: usize) -> Res<Vec<u8>> {
     let u = Url::parse(url)?;
     let (s, status) = open_with_status(&u)?;
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status} for {url}"));
     }
-    s.read_all().map_err(|e| format!("{e} ({url})"))
+    s.read_all(limit, Some(Instant::now() + DOC_DEADLINE))
+        .map_err(|e| format!("{e} ({url})"))
 }
 
 /// GET a small document; `Ok(None)` for 403/404/410.
@@ -722,7 +839,9 @@ pub fn get_opt(url: &str) -> Res<Option<Vec<u8>>> {
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {status} for {url}"));
     }
-    s.read_all().map(Some).map_err(|e| format!("{e} ({url})"))
+    s.read_all(MAX_DOC, Some(Instant::now() + DOC_DEADLINE))
+        .map(Some)
+        .map_err(|e| format!("{e} ({url})"))
 }
 
 /// One file to fetch.
@@ -1337,6 +1456,78 @@ mod tests {
         let e = Url::parse("ftp://h/x").unwrap_err();
         assert!(e.contains("ftp"), "error must name the scheme: {e}");
         assert!(e.contains("ftp://h/x"), "error must name the url: {e}");
+    }
+
+    #[test]
+    fn url_rejects_control_characters_in_host_and_path() {
+        // Both values can come from a remote document (a version JSON's
+        // `downloads.*.url`, a Modrinth `files[].url`) and JSON string escapes
+        // carry `\r\n` verbatim, so this is reachable input. A CR/LF in the path
+        // would terminate the request line and turn the rest into headers.
+        for bad in [
+            "https://example.com/a\r\nX-Injected: 1",
+            "https://example.com/a\nX-Injected: 1",
+            "https://example.com/a\rb",
+            "https://exa\r\nmple.com/a",
+            "https://example.com/a\x00b",
+            "https://example.com/a b",
+        ] {
+            let r = Url::parse(bad);
+            assert!(r.is_err(), "{bad:?} should be rejected, got {r:?}");
+        }
+        // A trailing newline is *trimmed* by `Url::parse`, so it never reaches
+        // the request line — that is safe, and worth pinning so a future change
+        // to the trimming does not silently reopen the hole.
+        let u = Url::parse("https://example.com/a\n").expect("trailing whitespace is trimmed");
+        assert_eq!(u.path, "/a");
+        // A legitimate query string keeps working.
+        let u = Url::parse("https://h/p?a=1&b=2").expect("url");
+        assert_eq!(u.path, "/p?a=1&b=2");
+    }
+
+    #[test]
+    fn open_with_refuses_a_directly_built_url_with_crlf() {
+        // `Url`'s fields are `pub`, so `Url::parse` is not the only way to make
+        // one. `open_with` re-checks because that is the function that actually
+        // hands the values to WinHTTP, and it must fail *before* any socket is
+        // opened — hence a bogus host that would never resolve.
+        fn err(r: Res<Session>) -> String {
+            match r {
+                Ok(_) => String::new(),
+                Err(e) => e,
+            }
+        }
+        let bad = Url {
+            secure: false,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            path: "/a\r\nX-Injected: yes\r\n\r\n".to_string(),
+        };
+        let e = err(Session::open_with(&bad, None));
+        assert!(e.contains("control character"), "{e}");
+        // A control character in the host is refused the same way.
+        let bad_host = Url {
+            secure: false,
+            host: "127.0.0.1\r\nX: 1".to_string(),
+            port: 1,
+            path: "/".to_string(),
+        };
+        assert!(!err(Session::open_with(&bad_host, None)).is_empty());
+        // The one header the launcher builds itself must still be accepted.
+        let ok = Url {
+            secure: false,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            path: "/".to_string(),
+        };
+        // Fails to *connect* (nothing listens on port 1), which proves the
+        // header check let it through rather than rejecting it up front.
+        let e = err(Session::open_with(&ok, Some("Range: bytes=0-\r\n")));
+        assert!(!e.is_empty(), "must fail to connect");
+        assert!(!e.contains("malformed request headers"), "{e}");
+        // A header carrying an embedded second line is refused.
+        let e = err(Session::open_with(&ok, Some("Range: bytes=0-\r\nX-Evil: 1\r\n")));
+        assert!(e.contains("malformed request headers"), "{e}");
     }
 
     #[test]

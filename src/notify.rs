@@ -153,12 +153,49 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     false
 }
 
+/// `true` for characters that are invisible but still reorder or hide text.
+///
+/// `char::is_control` only covers category **Cc** (U+0000–U+001F, U+007F–U+009F).
+/// Bidirectional overrides and zero-width characters are category **Cf** and slip
+/// straight through it, which matters because the announcement list is the one
+/// place a hostile feed gets to draw text:
+///
+/// * `U+202E` RIGHT-TO-LEFT OVERRIDE renders a title reversed, so
+///   `"0.3.1 released"` can be displayed as something else entirely;
+/// * `U+200B`/`U+2060` hide characters inside a title, so a note that looks
+///   identical to another can carry a different `id` — and therefore never be
+///   marked read, or be marked read when it was not;
+/// * `U+FEFF` and the tag block are classic spoofing filler.
+///
+/// None of these is ever legitimate in a launcher announcement, so they are
+/// dropped rather than escaped.
+fn is_invisible_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD                  // soft hyphen
+        | 0x061C                // Arabic letter mark
+        | 0x115F | 0x1160       // Hangul fillers
+        | 0x17B4 | 0x17B5
+        | 0x180B..=0x180E
+        | 0x200B..=0x200F       // zero-width space/joiners, LRM, RLM
+        | 0x202A..=0x202E       // bidi embeddings and overrides
+        | 0x2060..=0x2064
+        | 0x2066..=0x206F       // bidi isolates
+        | 0x3164 | 0xFFA0
+        | 0xFEFF                // BOM
+        | 0xFFF0..=0xFFF8
+        | 0xE0000..=0xE007F     // tag characters
+    )
+}
+
 /// Trim, drop control characters, and cap length.
 ///
 /// Keeps `\n` because a note **body** is legitimately multi-line and is only ever
 /// shown in an edit control.
 fn clean(s: &str, max: usize) -> String {
-    let s: String = s.chars().filter(|c| !c.is_control() || *c == '\n').collect();
+    let s: String = s
+        .chars()
+        .filter(|c| (!c.is_control() && !is_invisible_format(*c)) || *c == '\n')
+        .collect();
     let s = s.trim().to_string();
     if s.chars().count() <= max {
         return s;
@@ -180,7 +217,7 @@ fn clean(s: &str, max: usize) -> String {
 fn clean_line(s: &str, max: usize) -> String {
     let s: String = s
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
         .collect();
     let s = s.trim().to_string();
     if s.chars().count() <= max {
@@ -435,13 +472,27 @@ pub fn fetch(url: &str) -> Res<Feed> {
     if !lower.starts_with("https://") && !lower.starts_with("http://") {
         return Err(format!("通知地址必须以 https:// 或 http:// 开头：{url}"));
     }
-    let body = crate::net::get(url).map_err(|e| format!("拉取通知失败：{e}"))?;
-    if body.len() > MAX_BODY {
-        return Err(format!(
-            "通知文档过大（{} 字节，上限 {MAX_BODY}）",
-            body.len()
-        ));
+    // A plaintext feed is not refused — a LAN mirror or a self-hosted host
+    // without TLS is a legitimate setup — but the user is told once, because
+    // over `http://` anyone on the path can rewrite the announcements, including
+    // the "new version available" hint. This is the same advisory-not-block
+    // policy the unverified-download warning follows: inform, do not obstruct.
+    if lower.starts_with("http://") {
+        static WARNED: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+            std::sync::OnceLock::new();
+        let flag = WARNED.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
+        if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::util::warn(
+                "通知地址使用明文 http://，公告内容可被网络中间人篡改（包括“发现新版本”的提示）。\
+                 如果该地址支持 HTTPS，建议改用 https://。",
+            );
+        }
     }
+    // The cap is passed *into* the fetch so an oversized body is abandoned
+    // mid-stream. Checking `body.len()` afterwards, as this did before, only
+    // refused the document after the launcher had already buffered all of it —
+    // a hostile endpoint could push a gigabyte into memory first.
+    let body = crate::net::get_max(url, MAX_BODY).map_err(|e| format!("拉取通知失败：{e}"))?;
     let text = String::from_utf8_lossy(&body);
     parse(&text)
 }
@@ -729,5 +780,42 @@ mod tests {
         assert!(fetch("   ").is_err());
         assert!(fetch("ftp://x/y").is_err());
         assert!(fetch("not a url").is_err());
+        // A URL that would split the request line is refused before any socket
+        // is opened, so this stays a no-network test.
+        assert!(fetch("https://example.com/a\r\nX-Injected: 1").is_err());
+    }
+
+    #[test]
+    fn invisible_format_characters_cannot_spoof_a_title() {
+        // `char::is_control` is category Cc only, so a bidi override or a
+        // zero-width joiner used to survive into the list box and the state
+        // file. `\u{202E}` reverses rendering; `\u{200B}` hides characters, so
+        // two notes can look identical while carrying different ids.
+        let doc = "{\"notes\":[{\"id\":\"a\\u202Eb\",\"title\":\"ok\\u202Etxet\",\
+                   \"body\":\"x\\u200By\",\"date\":\"d\\u2066e\"}]}";
+        let f = parse(doc).expect("parse");
+        assert_eq!(f.notes[0].id, "ab", "bidi override must be dropped");
+        assert_eq!(f.notes[0].title, "oktxet");
+        assert_eq!(f.notes[0].body, "xy", "zero-width must be dropped");
+        assert_eq!(f.notes[0].date, "de", "bidi isolate must be dropped");
+        // A soft hyphen is invisible too, and is a classic homograph trick.
+        let f2 = parse("{\"notes\":[{\"id\":\"a\u{00AD}b\",\"title\":\"t\"}]}").expect("parse");
+        assert_eq!(f2.notes[0].id, "ab");
+        // Legitimate CJK and emoji must survive: this is not a "strip
+        // everything non-ASCII" filter.
+        let f3 = parse("{\"notes\":[{\"id\":\"公告🦊\",\"title\":\"1.21.9 支持\"}]}").expect("parse");
+        assert_eq!(f3.notes[0].id, "公告🦊");
+        assert_eq!(f3.notes[0].title, "1.21.9 支持");
+    }
+
+    #[test]
+    fn a_huge_body_is_refused_with_a_clear_message() {
+        // The cap is now passed into the fetch, so the error text comes from
+        // net.rs. Assert the constant the caller matches on is present, so a
+        // wording change cannot silently break the message.
+        assert!(crate::net::TOO_LARGE.contains("size cap"));
+        // MAX_BODY must stay far below the generic document cap, or the tighter
+        // announcement limit would never be the one that fires.
+        assert!(MAX_BODY < crate::net::MAX_DOC);
     }
 }

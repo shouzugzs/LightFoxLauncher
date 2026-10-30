@@ -299,6 +299,9 @@ struct App {
     seen: lightfox::notify::Seen,
     /// Set while a feed fetch runs, so a second click cannot stack requests.
     feed_busy: std::sync::atomic::AtomicBool,
+    /// When the in-flight fetch started, so a lost worker cannot wedge the
+    /// button forever. `None` whenever `feed_busy` is false.
+    feed_started: Option<std::time::Instant>,
     /// Set when the worker finished, carrying the result for the UI thread.
     feed_q: Arc<Mutex<Option<Result<lightfox::notify::Feed, String>>>>,
     /// Saved settings, reloaded on start and written by the settings page.
@@ -447,6 +450,7 @@ impl App {
             feed: None,
             seen: lightfox::notify::Seen::default(),
             feed_busy: std::sync::atomic::AtomicBool::new(false),
+            feed_started: None,
             feed_q: Arc::new(Mutex::new(None)),
             settings: Settings::default(),
             core_seeded: std::sync::atomic::AtomicBool::new(false),
@@ -811,6 +815,7 @@ unsafe extern "system" fn wnd_proc(
                 drain_log(&*app_ptr);
                 drain_progress(&*app_ptr);
                 drain_done(&mut *app_ptr);
+                feed_unwedge(&mut *app_ptr);
             }
             0
         }
@@ -4873,14 +4878,9 @@ fn notify_fetch(app: &mut App, url: String, quiet: bool) {
     if !quiet {
         set_notify_status(app, "正在检查…");
     }
+    app.feed_started = Some(std::time::Instant::now());
     let q = app.feed_q.clone();
     let hwnd_val = app.hwnd as usize;
-    let busy = {
-        // The flag lives in App, so the worker cannot clear it directly; the UI
-        // thread clears it in `notify_done`.
-        std::sync::Arc::new(())
-    };
-    let _ = busy;
     std::thread::spawn(move || {
         let res = lightfox::notify::fetch(&url);
         if let Ok(mut g) = q.lock() {
@@ -4892,10 +4892,65 @@ fn notify_fetch(app: &mut App, url: String, quiet: bool) {
     });
 }
 
+/// How long a fetch may stay silent before the UI treats it as lost.
+///
+/// Deliberately longer than [`lightfox::net`]'s own document deadline, so a slow
+/// but working request is never cut off by the UI — this only rescues a worker
+/// that vanished without reporting at all.
+const FEED_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Clear a `feed_busy` flag that a vanished worker left set.
+///
+/// `notify_fetch` refuses to start a second request while the flag is set, and
+/// the flag is only cleared by `notify_done` — which runs when the worker posts
+/// `WM_APP_NOTIFY`. If that post never arrives (the thread panicked under
+/// `panic = "abort"`'s unwind-free cousin, or the message was dropped while the
+/// window was being destroyed), 检查更新 stays dead for the rest of the session
+/// with no way for the user to recover short of restarting. This gives the
+/// button a way back: after a generous grace period, a fetch that still has not
+/// reported is treated as lost.
+fn feed_unwedge(app: &mut App) {
+    if !app
+        .feed_busy
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let Some(started) = app.feed_started else {
+        return;
+    };
+    if started.elapsed() < FEED_GRACE {
+        return;
+    }
+    // Re-read the queue first: the worker may have stored its result but not
+    // yet posted the message. Taking it here is the same work `notify_done`
+    // would do, so the outcome is still shown.
+    let pending = match app.feed_q.lock() {
+        Ok(mut g) => g.take(),
+        Err(p) => p.into_inner().take(),
+    };
+    app.feed_busy
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    app.feed_started = None;
+    match pending {
+        Some(res) => {
+            // Re-inject through the normal path so the page still updates.
+            if let Ok(mut g) = app.feed_q.lock() {
+                *g = Some(res);
+            }
+            notify_done(app);
+        }
+        None => {
+            set_notify_status(app, "检查超时，请重试（网络或通知地址可能无响应）");
+        }
+    }
+}
+
 /// UI-thread half: take the worker result and repaint the page.
 fn notify_done(app: &mut App) {
     app.feed_busy
         .store(false, std::sync::atomic::Ordering::SeqCst);
+    app.feed_started = None;
     let res = match app.feed_q.lock() {
         Ok(mut g) => g.take(),
         Err(p) => p.into_inner().take(),
@@ -4907,26 +4962,38 @@ fn notify_done(app: &mut App) {
     match res {
         Ok(feed) => {
             let unseen = app.seen.unseen(&feed).len();
-            let update = feed
+            let newer = feed
                 .latest
                 .as_deref()
                 .filter(|v| lightfox::notify::is_newer(v, VERSION))
                 .map(|v| v.to_string());
             app.seen.last_check = lightfox::notify::now_secs();
-            if let Some(v) = &update {
-                // Remember it so the same update is not announced twice.
-                app.seen.reported_update = Some(v.clone());
-            }
+            // `reported_update` exists so the same version is announced once
+            // rather than on every start. It used to be written and never
+            // read, which made the field dead weight and re-announced every
+            // time; compare against it here, and only treat the update as new
+            // when it is a *different* version from the one already shown.
+            let announce = match &newer {
+                Some(v) if app.seen.reported_update.as_deref() == Some(v.as_str()) => None,
+                Some(v) => {
+                    app.seen.reported_update = Some(v.clone());
+                    Some(v.clone())
+                }
+                None => None,
+            };
             let _ = app.seen.save(&dir);
 
             let mut msg = format!("{} 条公告", feed.notes.len());
             if unseen > 0 {
                 msg.push_str(&format!("，{unseen} 条未读"));
             }
-            if let Some(v) = &update {
+            if let Some(v) = &announce {
                 msg.push_str(&format!(" · 有新版本 v{v}"));
+            } else if let Some(v) = &newer {
+                // Still tell the user, just without pretending it is news.
+                msg.push_str(&format!(" · 可更新到 v{v}"));
             }
-            if feed.notes.is_empty() && update.is_none() {
+            if feed.notes.is_empty() && newer.is_none() {
                 msg.push_str(" · 没有新内容");
             }
             app.feed = Some(feed);

@@ -16,6 +16,20 @@ use std::path::{Path, PathBuf};
 
 use crate::util::Res;
 
+/// Collapse a value onto one line so it cannot forge a second `key=value` line.
+///
+/// Control characters become spaces and the result is trimmed. Used by
+/// [`Settings::save`] as a last line of defence: `validate` covers the fields a
+/// form produces, but `Settings` is public and `save` can be called with
+/// anything, including a value read from a hand-edited file.
+fn one_line(v: &str) -> String {
+    v.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// User-tunable options that outlive a single run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -99,6 +113,13 @@ impl Settings {
 
     pub fn save(&self, dir: &Path) -> Res<()> {
         crate::util::mkdirs(dir)?;
+        // Every value is written as one `key=value` line, so a newline in any of
+        // them would inject a second line — the same class of bug `notify.rs`
+        // fixes for `lfl-seen.ini`. `validate()` already rejects control
+        // characters in `user`/`memory`/`instance`, but `java` and `feed_url`
+        // are only scheme-checked, and `save` is public, so a caller can reach
+        // this with anything. Sanitising at the write point means no path can
+        // produce a malformed file, whatever the values are.
         let body = format!(
             "# LFL settings — edit by hand or via the 设置 page\n\
              workers={}\n\
@@ -111,13 +132,13 @@ impl Settings {
              feed_url={}\n\
              check_feed={}\n",
             self.workers,
-            self.java.clone().unwrap_or_default(),
-            self.memory,
-            self.user,
-            self.instance,
+            one_line(&self.java.clone().unwrap_or_default()),
+            one_line(&self.memory),
+            one_line(&self.user),
+            one_line(&self.instance),
             self.resume as u8,
             self.progress as u8,
-            self.feed_url.clone().unwrap_or_default(),
+            one_line(&self.feed_url.clone().unwrap_or_default()),
             self.check_feed as u8,
         );
         let target = Settings::file(dir);
@@ -247,6 +268,34 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert!(s.resume);
         assert!(s.progress);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_cannot_inject_a_second_key_line() {
+        // `Settings` is public and `save` takes whatever the struct holds, so a
+        // value with a newline must not be able to forge another line. The
+        // `java` field is the realistic route: it is a path, only scheme-checked
+        // for `feed_url`, and comes from a file the docs invite users to edit.
+        let dir = temp("inject");
+        let s = Settings {
+            java: Some("C:/jdk/bin/javaw.exe\nuser=Admin".to_string()),
+            feed_url: Some("https://h/f\ncheck_feed=0".to_string()),
+            ..Settings::default()
+        };
+        s.save(&dir).unwrap();
+        let body = std::fs::read_to_string(Settings::file(&dir)).unwrap();
+        let count_key = |k: &str| {
+            body.lines()
+                .filter(|l| l.starts_with(&format!("{k}=")))
+                .count()
+        };
+        assert_eq!(count_key("user"), 1, "{body}");
+        assert_eq!(count_key("check_feed"), 1, "{body}");
+        assert_eq!(count_key("java"), 1, "{body}");
+        // The injected text is still present, just flattened onto the same line,
+        // so the value is not silently truncated — only made harmless.
+        assert!(body.contains("javaw.exe user=Admin"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
