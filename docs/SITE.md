@@ -38,8 +38,8 @@ Pages 自动构建并发布。每一次变更都在 git 历史里，可审计、
    * Build command: **留空**（站点就是 `site/` 原样静态文件，不需要构建）
    * Build output directory: `site`
 3. 保存并部署。首次部署后 Cloudflare 分配 `*.pages.dev` 域名，把它填进
-   `site/index.html` 里提示用户的通知地址（当前占位为
-   `https://lightfox.pages.dev/feed.json`，部署后替换为实际域名）。
+   `site/index.html` 里提示用户的通知地址（当前为
+   `https://lightfoxlauncher.pages.dev/feed.json`）。
 4. （可选）绑定自定义域。
 
 之后每次 push 到 `main`，Cloudflare 自动重新发布；PR 会得到独立预览 URL。
