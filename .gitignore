@@ -10,3 +10,6 @@
 # Local scratch
 *.log
 *.png
+
+# Private honeypot deployment: never published to the public repository
+/private-site/

@@ -1,7 +1,2 @@
 User-agent: *
 Allow: /
-Disallow: /admin
-Disallow: /panel
-Disallow: /wp-admin
-Disallow: /api
-Disallow: /.well-known/admin
