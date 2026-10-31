@@ -1,5 +1,5 @@
 User-agent: *
 Allow: /
-Disallow: https://lightfox-honeypot.pages.dev/admin
-Disallow: https://lightfox-honeypot.pages.dev/panel
-Disallow: https://lightfox-honeypot.pages.dev/wp-admin
+Disallow: https://lightfox-cdn.pages.dev/admin
+Disallow: https://lightfox-cdn.pages.dev/panel
+Disallow: https://lightfox-cdn.pages.dev/wp-admin

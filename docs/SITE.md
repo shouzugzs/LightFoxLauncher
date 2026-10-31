@@ -82,7 +82,7 @@ Pages 自动构建并发布。每一次变更都在 git 历史里，可审计、
 
 **流量从哪来（跨域导流）**：蜜罐是独立域名，扫描器不会凭空知道它。导流
 靠介绍站页脚三条 `display:none` 的隐藏链接——指向蜜罐域名的**绝对 URL**
-（`https://lightfox-honeypot.pages.dev/admin` 等），以及 robots.txt 里的对应
+（`https://lightfox-cdn.pages.dev/admin` 等），以及 robots.txt 里的对应
 Disallow。公开仓库里因此出现蜜罐**域名**，但这不等于暴露蜜罐：让蜜罐露馅
 的是它的**源码**（页面结构、Function 逻辑），源码始终不在任何仓库里；而
 "站内有个 admin 链接"本身是所有真实站点都有的正常现象。解析 HTML 顺链接
@@ -136,12 +136,12 @@ npx wrangler pages deploy public --project-name lightfox-honeypot
 ```
 
 首次 `deploy` 会询问项目名与生产分支，按上面给的名字即可。部署完成后
-蜜罐在 `https://lightfox-honeypot.pages.dev` 独立可用；如果想让蜜罐与介绍站
+蜜罐在 `https://lightfox-cdn.pages.dev` 独立可用；如果想让蜜罐与介绍站
 同域（路径形态更像真实站点），改用自定义域：给两个项目分别绑定同一域名的
 不同子域，或在介绍站项目里把 `/admin` 等路径反代到蜜罐项目——后两者是
 可选优化，初始部署不需要。
 
-验证：`curl -X POST -d "u=1&p=2" https://lightfox-honeypot.pages.dev/api/login`
+验证：`curl -X POST -d "u=1&p=2" https://lightfox-cdn.pages.dev/api/login`
 应返回 `{"ok":false}`，KV 里出现一条 `hit:` 事件。
 
 ## 边界声明
