@@ -32,14 +32,15 @@ const GAA_FLAG_SKIP_ANYCAST: u32 = 0x0002;
 const GAA_FLAG_SKIP_MULTICAST: u32 = 0x0004;
 const GAA_FLAG_INCLUDE_GATEWAYS: u32 = 0x0040;
 
-const IpPrefixOriginManual: u32 = 1;
-const IpPrefixOriginWellKnown: u32 = 2;
-const IpPrefixOriginDhcp: u32 = 3;
-const IpPrefixOriginRouterAdvertisement: u32 = 4;
+/// `IpPrefixOriginManual`: the address was configured by hand.
+const PREFIX_ORIGIN_MANUAL: u32 = 1;
+const PREFIX_ORIGIN_WELL_KNOWN: u32 = 2;
+const PREFIX_ORIGIN_DHCP: u32 = 3;
+const PREFIX_ORIGIN_ROUTER_ADVERTISEMENT: u32 = 4;
 
-const IpSuffixOriginRandom: u32 = 3;
+const SUFFIX_ORIGIN_RANDOM: u32 = 3;
 
-const IpDadStatePreferred: u32 = 1;
+const DAD_STATE_PREFERRED: u32 = 1;
 
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 
@@ -121,18 +122,18 @@ fn is_up(oper: u32) -> bool {
 /// prefix: 2000::/3 is the currently-routable global unicast space; fe80::/10
 /// link-local and fc00::/7 ULA fail the check.
 fn hostable_v6(u: &IpAdapterUnicastAddress) -> bool {
-    if u.address.family != AF_INET6 || u.dad_state != IpDadStatePreferred {
+    if u.address.family != AF_INET6 || u.dad_state != DAD_STATE_PREFERRED {
         return false;
     }
     // Temporary addresses (RFC 4941) have SuffixOrigin == Random and are
     // explicitly marked to skip as source; both mean "not for hosting".
-    if u.suffix_origin == IpSuffixOriginRandom || u.skip_as_source != 0 {
+    if u.suffix_origin == SUFFIX_ORIGIN_RANDOM || u.skip_as_source != 0 {
         return false;
     }
     // Only permanent-looking origins: manual, well-known, DHCPv6, or RA.
     if !matches!(
         u.prefix_origin,
-        IpPrefixOriginManual | IpPrefixOriginWellKnown | IpPrefixOriginDhcp | IpPrefixOriginRouterAdvertisement
+        PREFIX_ORIGIN_MANUAL | PREFIX_ORIGIN_WELL_KNOWN | PREFIX_ORIGIN_DHCP | PREFIX_ORIGIN_ROUTER_ADVERTISEMENT
     ) {
         return false;
     }
@@ -216,7 +217,7 @@ unsafe fn collect_adapters(flags: u32) -> HostNet {
             let mut u = a.first_unicast;
             while !u.is_null() {
                 let ua = &*u;
-                if ua.dad_state == IpDadStatePreferred {
+                if ua.dad_state == DAD_STATE_PREFERRED {
                     if hostable_v6(ua) {
                         if let Some(v6) = v6_from_sockaddr(&ua.address) {
                             let s = v6.to_string();

@@ -149,7 +149,6 @@ const ID_HOST_ADDR: i32 = 755;
 const ID_HOST_PORT: i32 = 756;
 const ID_HOST_STATUS: i32 = 757;
 const ID_HOST_INFO: i32 = 758;
-const ID_HOST_JOIN: i32 = 759;
 const ID_HOST_ROOM: i32 = 760;
 const ID_HOST_ROOM_NEW: i32 = 761;
 const ID_HOST_ROOM_JOIN: i32 = 762;
@@ -332,8 +331,23 @@ struct App {
     host_busy: std::sync::atomic::AtomicBool,
     /// Port the in-flight attempt is for (cleanup must target the same port).
     host_port_busy: std::sync::atomic::AtomicU32,
+    /// The live room, if one is registered: what to re-register and when.
+    ///
+    /// A room expires after ten minutes on the server. The status line used to
+    /// promise "自动续期" with no renewal code behind it, so the room went
+    /// silently dead while the page still said 已上线. This holds the state the
+    /// timer needs to keep it alive, and `host_room_renewed` records the last
+    /// success so a failed renewal is visible instead of silent.
+    host_room_live: Arc<Mutex<Option<LiveRoom>>>,
+    /// Unix seconds of the last successful registration/renewal (0 = none).
+    host_room_renewed: std::sync::atomic::AtomicU64,
     /// Result channel for the hosting worker (same pattern as `feed_q`).
-    host_q: Arc<Mutex<Option<lightfox::hosting::HostReport>>>,
+    ///
+    /// A `HostMsg` rather than a bare `HostReport`: the 联机 page has three
+    /// actions (检测网络 / 开服 / 房号), and a room action must not overwrite
+    /// the address box or the firewall line that a 检测 or 开服 produced. The
+    /// kind tells `host_done` which parts of the page it is allowed to touch.
+    host_q: Arc<Mutex<Option<HostMsg>>>,
     /// Set while a feed fetch runs, so a second click cannot stack requests.
     feed_busy: std::sync::atomic::AtomicBool,
     /// When the in-flight fetch started, so a lost worker cannot wedge the
@@ -501,6 +515,8 @@ impl App {
             host_info: std::ptr::null_mut(),
             host_busy: std::sync::atomic::AtomicBool::new(false),
             host_port_busy: std::sync::atomic::AtomicU32::new(0),
+            host_room_live: Arc::new(Mutex::new(None)),
+            host_room_renewed: std::sync::atomic::AtomicU64::new(0),
             host_q: Arc::new(Mutex::new(None)),
             feed_busy: std::sync::atomic::AtomicBool::new(false),
             feed_started: None,
@@ -884,6 +900,7 @@ unsafe extern "system" fn wnd_proc(
                 drain_progress(&*app_ptr);
                 drain_done(&mut *app_ptr);
                 feed_unwedge(&mut *app_ptr);
+                room_renew_tick(&mut *app_ptr);
             }
             0
         }
@@ -1844,13 +1861,16 @@ fn build_host_page(app: &mut App) {
 }
 
 /// Run `f` on a worker thread and post `WM_APP_HOST` when done, carrying the
-/// report through `host_q` — the same worker/result pattern the feed page uses.
+/// result through `host_q` — the same worker/result pattern the feed page uses.
 fn host_spawn<F>(app: &mut App, port: u16, f: F)
 where
-    F: FnOnce(u16) -> lightfox::hosting::HostReport + Send + 'static,
+    F: FnOnce(u16) -> HostMsg + Send + 'static,
 {
     if app.host_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return; // one attempt at a time
+        // Say so rather than doing nothing: a silent no-op on a button press
+        // reads as "the launcher is broken".
+        set_host_status(app, "上一个操作还没完成，请稍等。");
+        return;
     }
     app.host_port_busy.store(port as u32, std::sync::atomic::Ordering::SeqCst);
     set_host_status(app, "正在处理…（UPnP/防火墙最多需要约 30 秒）");
@@ -1868,17 +1888,117 @@ where
     });
 }
 
+/// What a live room needs in order to be renewed.
+///
+/// Kept beside the code rather than read back from the controls, so a renewal
+/// does not depend on the user leaving the page as it was.
+#[derive(Clone)]
+struct LiveRoom {
+    code: lightfox::room::RoomCode,
+    server: String,
+    addr: String,
+    port: u16,
+    /// Seconds the registry granted; renewal fires at half of it.
+    ttl: u64,
+}
+
+/// What a 联机-page worker finished doing.
+///
+/// The page has three independent actions and one shared result slot, so the
+/// result has to carry which action produced it. Without this, a room
+/// registration (whose report is otherwise empty) overwrote the address box
+/// with the "nothing to share" placeholder and rewrote the firewall line as
+/// "not allowed" — both of which were lies about state the user had just
+/// established with 检测网络 / 开服.
+enum HostMsg {
+    /// 检测网络: addresses and firewall state only.
+    Detect(lightfox::hosting::HostReport),
+    /// 开服: the full attempt — may replace the address box.
+    Open(lightfox::hosting::HostReport),
+    /// 关闭映射: notes only, never touches the address box.
+    Close(lightfox::hosting::HostReport),
+    /// 建房号: notes only; the code is already in its own box.
+    RoomNew(lightfox::hosting::HostReport),
+    /// 用房间号连接: notes plus the address the friend should dial.
+    RoomJoin {
+        report: lightfox::hosting::HostReport,
+        /// Ready-to-paste `host:port`, already bracketed for IPv6.
+        addr: Option<String>,
+    },
+}
+
+/// Renew the live room when half its lifetime has passed.
+///
+/// Called from the 200 ms UI timer, so it costs nothing while no room exists.
+/// The renewal is a plain re-register: the registry treats a repeat POST for
+/// the same code as "overwrite and restart the TTL", which is exactly what a
+/// renewal is. Without this the status line's "有效期 10 分钟" was a promise the
+/// code did not keep — the room died and the page still said 已上线.
+fn room_renew_tick(app: &mut App) {
+    let live = match app.host_room_live.lock() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    };
+    let Some(live) = live else { return };
+    let now = lightfox::notify::now_secs();
+    let last = app
+        .host_room_renewed
+        .load(std::sync::atomic::Ordering::SeqCst);
+    // Renew at half the TTL: late enough not to spam, early enough that one
+    // failed attempt still leaves time to retry before expiry.
+    let due = last + (live.ttl / 2).max(60);
+    if now < due {
+        return;
+    }
+    // Claim the slot before spawning so the timer cannot start a second one
+    // while this request is in flight.
+    app.host_room_renewed
+        .store(now, std::sync::atomic::Ordering::SeqCst);
+    let q = app.host_q.clone();
+    let hwnd_val = app.hwnd as usize;
+    // Renewal does not take `host_busy`: it is background upkeep, and blocking
+    // the user's own buttons for it would be worse than a rare overlapping
+    // request (the registry is idempotent for the same code).
+    std::thread::spawn(move || {
+        let res = lightfox::room::register(&live.server, &live.code, &live.addr, live.port);
+        if let Ok(mut g) = q.lock() {
+            let mut r = lightfox::hosting::HostReport::default();
+            match res {
+                Ok(_) => r
+                    .notes
+                    .push(format!("房间号 {} 已自动续期。", live.code.as_str())),
+                Err(e) => r.notes.push(format!(
+                    "房间号 {} 自动续期失败：{e}。请重新点“建房号”换新号。",
+                    live.code.as_str()
+                )),
+            }
+            *g = Some(HostMsg::RoomNew(r));
+        }
+        unsafe {
+            PostMessageW(hwnd_val as HWND, WM_APP_HOST, 0, 0);
+        }
+    });
+}
+
 /// UI-thread half: take the worker's report and render it.
 fn host_done(app: &mut App) {
     app.host_busy.store(false, std::sync::atomic::Ordering::SeqCst);
     app.host_port_busy.store(0, std::sync::atomic::Ordering::SeqCst);
     enable_host_buttons(app, true);
-    let res = match app.host_q.lock() {
+    let msg = match app.host_q.lock() {
         Ok(mut g) => g.take(),
         Err(p) => p.into_inner().take(),
     };
-    let Some(report) = res else { return };
+    let Some(msg) = msg else { return };
     let port = host_port_of(app);
+
+    // Which parts of the page this result may rewrite.
+    let (report, may_set_addr, forced_addr) = match msg {
+        HostMsg::Detect(r) | HostMsg::Open(r) => (r, true, None),
+        HostMsg::Close(r) | HostMsg::RoomNew(r) => (r, false, None),
+        HostMsg::RoomJoin { report, addr } => (report, true, addr),
+    };
+
     let mut lines: Vec<String> = Vec::new();
     if !report.v6_addresses.is_empty() {
         lines.push("── IPv6 直连（优先推荐）──".to_string());
@@ -1890,28 +2010,41 @@ fn host_done(app: &mut App) {
         lines.push("── IPv4 端口映射成功 ──".to_string());
         lines.push(format!("{}:{}（经由 {}）", m.ip, m.port, m.via));
     }
-    lines.push(format!(
-        "防火墙规则：{}",
-        if report.firewall_ok { "已放行" } else { "未放行（见下方说明）" }
-    ));
+    // Only a detect/open result has anything to say about the firewall; a room
+    // action must leave the line alone rather than claim "not allowed".
+    if may_set_addr {
+        lines.push(format!(
+            "防火墙规则：{}",
+            if report.firewall_ok { "已放行" } else { "未放行（见下方说明）" }
+        ));
+    }
     for n in &report.notes {
         lines.push(String::new());
         lines.push(format!("· {n}"));
     }
-    // The shareable address block: whatever friends can actually use.
-    let mut share = String::new();
-    if !report.v6_addresses.is_empty() {
-        share.push_str(&format!("[{}]:{}\r\n", report.v6_addresses[0], port));
-    }
-    if let Some(m) = &report.v4_mapping {
-        share.push_str(&format!("{}:{}\r\n", m.ip, m.port));
-    }
-    if share.is_empty() {
-        share.push_str("（暂无可分享的直连地址，请阅读下方说明）\r\n");
-    }
+
     unsafe {
-        let w = wide(&share);
-        SetWindowTextW(app.host_addr, w.as_ptr());
+        if may_set_addr {
+            let share = match &forced_addr {
+                // A room lookup knows the exact address the friend must dial.
+                Some(a) => format!("{a}\r\n"),
+                None => {
+                    let mut s = String::new();
+                    if !report.v6_addresses.is_empty() {
+                        s.push_str(&format!("[{}]:{}\r\n", report.v6_addresses[0], port));
+                    }
+                    if let Some(m) = &report.v4_mapping {
+                        s.push_str(&format!("{}:{}\r\n", m.ip, m.port));
+                    }
+                    if s.is_empty() {
+                        s.push_str("（暂无可分享的直连地址，请阅读下方说明）\r\n");
+                    }
+                    s
+                }
+            };
+            let w = wide(&share);
+            SetWindowTextW(app.host_addr, w.as_ptr());
+        }
         let info = lines.join("\r\n");
         let w = wide(&info);
         SetWindowTextW(app.host_info, w.as_ptr());
@@ -1919,8 +2052,26 @@ fn host_done(app: &mut App) {
     set_host_status(app, "完成。");
 }
 
+/// Read the port box.
+///
+/// Returns `None` for anything that is not a usable port instead of silently
+/// substituting 25565: a user who typed 70000 or left the box empty should be
+/// told, not quietly given a different port than the one they see.
+fn host_port_opt(app: &App) -> Option<u16> {
+    let text = window_text(app.host_port);
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    match t.parse::<u16>() {
+        Ok(0) | Err(_) => None,
+        Ok(p) => Some(p),
+    }
+}
+
+/// The port, or 25565 when the box is empty/unusable (display-only paths).
 fn host_port_of(app: &App) -> u16 {
-    window_text(app.host_port).trim().parse().unwrap_or(25565)
+    host_port_opt(app).unwrap_or(25565)
 }
 
 fn set_host_status(app: &App, text: &str) {
@@ -1960,23 +2111,22 @@ fn host_detect_now(app: &mut App) {
         r.notes.push(format!(
             "检测完成（目标端口 {port}）。点“开服（映射端口）”开始联机配置。"
         ));
-        r
+        HostMsg::Detect(r)
     });
 }
 
 /// "开服": the full hosting attempt (firewall + UPnP + NAT-PMP fallback).
 fn host_open_now(app: &mut App) {
-    let port = host_port_of(app);
-    if port == 0 {
-        set_host_status(app, "端口无效：不能为 0。");
+    let Some(port) = host_port_opt(app) else {
+        set_host_status(app, "端口无效：请填写 1–65535 之间的数字。");
         return;
-    }
+    };
     host_spawn(app, port, |port| {
-        lightfox::hosting::attempt(port).unwrap_or_else(|e| {
+        HostMsg::Open(lightfox::hosting::attempt(port).unwrap_or_else(|e| {
             let mut r = lightfox::hosting::HostReport::default();
             r.notes.push(format!("开服尝试失败：{e}"));
             r
-        })
+        }))
     });
 }
 
@@ -1989,7 +2139,7 @@ fn host_close_now(app: &mut App) {
             Ok(()) => r.notes.push(format!("已请求删除端口 {port} 的映射。部分路由器的映射表刷新有延迟。")),
             Err(e) => r.notes.push(format!("删除映射失败：{e}")),
         }
-        r
+        HostMsg::Close(r)
     });
 }
 
@@ -2037,13 +2187,15 @@ fn host_room_new(app: &mut App) {
         SetWindowTextW(app.host_room, w.as_ptr());
     }
     let c2 = code.clone();
+    let live_server = server.clone();
+    let live_addr = ip.clone();
     host_spawn(app, port, move |_p| {
         let mut r = lightfox::hosting::HostReport::default();
         match lightfox::room::register(&server, &c2, &ip, port) {
             Ok(ttl) => {
                 r.notes.push(format!("房间号 {} 已上线（{}:{port}）。", c2.as_str(), ip));
                 r.notes.push(format!(
-                    "有效期约 {} 分钟；启动器运行期间每 5 分钟自动续期。",
+                    "有效期约 {} 分钟，启动器会自动续期；也可随时点“建房号”换新号。",
                     ttl / 60
                 ));
                 r.notes.push("把房号告诉朋友，他们在同一页输入房号点“用房间号连接”。".to_string());
@@ -2053,8 +2205,22 @@ fn host_room_new(app: &mut App) {
                 r.notes.push("房号已生成但未生效；检查网络或稍后重试。".to_string());
             }
         }
-        r
+        HostMsg::RoomNew(r)
     });
+    // Record what a renewal would need. Stored before the result arrives so a
+    // fast first tick cannot miss it; a failed registration simply fails to
+    // renew later, which is the same outcome as not renewing at all.
+    if let Ok(mut g) = app.host_room_live.lock() {
+        *g = Some(LiveRoom {
+            code,
+            server: live_server,
+            addr: live_addr,
+            port,
+            ttl: 600,
+        });
+    }
+    app.host_room_renewed
+        .store(lightfox::notify::now_secs(), std::sync::atomic::Ordering::SeqCst);
 }
 
 /// "用房间号连接": look the code up and put the host's address in the box.
@@ -2085,13 +2251,23 @@ fn host_room_join(app: &mut App) {
                 };
                 r.notes.push(format!("房号 {} → {shown}", code.as_str()));
                 r.notes.push("在游戏的“多人游戏 → 直接连接”里输入上面的地址。".to_string());
-                r.v6_addresses = vec![shown];
+                // `shown` is already a complete `host:port`, so it goes to the
+                // address box verbatim. Putting it in `v6_addresses` (which
+                // holds *bare* addresses that the renderer brackets itself)
+                // produced `[[addr]:port]:port`.
+                return HostMsg::RoomJoin {
+                    report: r,
+                    addr: Some(shown),
+                };
             }
             Err(e) => {
                 r.notes.push(format!("查询房号 {} 失败：{e}", code.as_str()));
             }
         }
-        r
+        HostMsg::RoomJoin {
+            report: r,
+            addr: None,
+        }
     });
 }
 
@@ -2140,7 +2316,6 @@ fn first_shareable_addr(text: &str) -> Option<(String, u16)> {
 }
 
 fn build_controls(app: &mut App) {
-    build_host_page(app);
     app.font_ui = make_font(-15, FW_NORMAL);
     app.font_bold = make_font(-15, FW_BOLD);
     // Published for the section headings, which are drawn on every repaint.
@@ -2158,6 +2333,10 @@ fn build_controls(app: &mut App) {
     build_search_page(app);
     build_version_page(app);
     build_notify_page(app);
+    // After the fonts exist: this page sets them on its controls, and the
+    // 联机 page was previously built before `font_ui` was created, which made
+    // every control fall back to the system default.
+    build_host_page(app);
     classify(app);
 
     // Theme the progress bar. Without this it paints in the default white,

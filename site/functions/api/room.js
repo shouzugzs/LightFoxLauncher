@@ -14,12 +14,24 @@
 //
 // Routes (all handled by this one module, dispatched by verb + pathname):
 //
-//   POST /api/room          {"code","addr","port"} -> {"ok":true,"expires":600}
-//   GET  /api/room/<code>   -> {"ok":true,"addr":...,"port":...}
+//   POST /api/room              {"code","addr","port"} -> {"ok":true,"expires":600}
+//   GET  /api/room?code=ABC234  -> {"ok":true,"addr":...,"port":...}
+//
+// The room code is a **query parameter, not a path segment**. Pages is a file
+// router: this module is deployed at `/api/room` and nothing else, so
+// `/api/room/ABC234` never reaches a Function at all — it is answered by the
+// static-asset 404 before any of this runs. Keeping the code in the query
+// string means the route set stays exactly `{/api/room}` and no `[code].js`
+// dynamic segment (nor a catch-all) is needed.
+//
+// A request that still uses the retired `/api/room/<code>` shape therefore
+// lands on `onRequest`, which answers 400 `bad_request` — the same answer as
+// a missing `code` parameter. Not 405, which would claim the verb is wrong,
+// and not 404, which would be indistinguishable from an expired room.
 //
 // Anything else gets a bare {"ok":false} with 405. That includes unknown
-// verbs and paths under the endpoint, so probing the shape of the API tells
-// a scanner nothing.
+// verbs and unknown paths, so probing the shape of the API tells a scanner
+// nothing.
 //
 // Storage: the KV binding named ROOMS. One key per room, `room:<code>`, value
 // is a single JSON object {"addr","port","ts"}, TTL 600s. The record expires
@@ -69,7 +81,13 @@ const RATE_TTL_SECONDS = 120;
 const MAX_BODY_BYTES = 1024;
 
 const REGISTER_PATH = "/api/room";
+// Prefix of the *retired* lookup shape. Nothing is served here any more; the
+// constant exists so the two places that must recognise a stale client agree
+// on one string.
 const LOOKUP_PREFIX = "/api/room/";
+// Query parameter carrying the code. One parameter, one value: `?code=A&code=B`
+// resolves to the first, so the lookup is always a single unambiguous code.
+const CODE_PARAM = "code";
 
 function json(obj, status) {
   return new Response(JSON.stringify(obj) + "\n", {
@@ -175,22 +193,40 @@ function isRegisterPath(pathname) {
   return pathname === REGISTER_PATH || pathname === REGISTER_PATH + "/";
 }
 
-// Extract the code from a lookup path. Returns { matched } so the caller can
-// tell "this is not a lookup route" (405) from "this is a lookup route with a
-// bad code" (400 bad_code). The path is NOT percent-decoded: a code is ASCII
-// by construction, so an encoded byte is a malformed code, not something to
-// normalise into a valid one.
-function codeFromPath(pathname) {
-  if (!pathname.startsWith(LOOKUP_PREFIX)) return { matched: false };
-  const rest = pathname.slice(LOOKUP_PREFIX.length);
-  // A nested segment is a different route, not a code containing a slash.
-  if (rest.includes("/")) return { matched: false };
-  return { matched: true, code: rest };
+// Extract the code from the query string. `URL.searchParams` percent-decodes,
+// which is what a query parameter is for, and the decoded value then goes
+// through the same allowlist as the registration path — so `?code=ABC%32%33%34`
+// means "ABC234" and `?code=AB%2F234` is a bad code, never a slash smuggled
+// into a KV key.
+//
+// An absent parameter and an empty one both come back as "", and the caller
+// answers bad_code for either: distinguishing "you forgot the parameter" from
+// "you sent an empty one" would only help someone probe the shape.
+function codeFromQuery(url) {
+  const code = url.searchParams.get(CODE_PARAM);
+  return code === null ? "" : code;
+}
+
+// The retired `/api/room/<code>` shape. It is not a route any more (see the
+// header comment), but a client built before the move still asks for it, and
+// if the request does reach this module the honest answer is "that is not a
+// request this endpoint understands" — 400 bad_request — rather than 405,
+// which would claim the verb is wrong, or 404, which would be mistaken for an
+// expired room. A bare `/api/room/` is the register path with a trailing
+// slash, not a retired lookup, so it is excluded here.
+function isRetiredLookupPath(pathname) {
+  return pathname.startsWith(LOOKUP_PREFIX) && pathname !== LOOKUP_PREFIX;
 }
 
 export async function onRequestPost(context) {
   const { request, env } = context;
   const pathname = new URL(request.url).pathname;
+  // Same carve-out as `onRequest`: the retired `/api/room/<code>` shape is a
+  // route that does not exist, so it is bad_request on every verb. Saying 405
+  // here would contradict what GET on the same path answers.
+  if (isRetiredLookupPath(pathname)) {
+    return json({ ok: false, error: "bad_request" }, 400);
+  }
   if (!isRegisterPath(pathname)) return json({ ok: false }, 405);
 
   const kv = env && env.ROOMS;
@@ -241,9 +277,11 @@ export async function onRequestPost(context) {
 
 export async function onRequestGet(context) {
   const { request, env } = context;
-  const pathname = new URL(request.url).pathname;
-  const { matched, code } = codeFromPath(pathname);
-  if (!matched) return json({ ok: false }, 405);
+  const url = new URL(request.url);
+  if (isRetiredLookupPath(url.pathname)) {
+    return json({ ok: false, error: "bad_request" }, 400);
+  }
+  const code = codeFromQuery(url);
 
   const kv = env && env.ROOMS;
   if (!kv) return json({ ok: false, error: "server_error" }, 500);
@@ -292,6 +330,29 @@ export async function onRequestGet(context) {
 // Every other verb (PUT, DELETE, OPTIONS, HEAD, ...) and every other path.
 // The body is identical to the other negative cases minus the error field, so
 // a prober learns only that this is not the right request.
+//
+// Two carve-outs:
+//
+//  * A path under the retired `/api/room/<code>` shape gets 400 bad_request
+//    instead. Pages is a file router, so that request normally never reaches
+//    this module — but when it does (a client built before the query parameter
+//    move), saying "405" would blame the verb and "404" would look like an
+//    expired room. The code is simply not where that client put it, which is
+//    exactly bad_request.
+//  * GET and POST on the register path are forwarded to the verb handlers.
+//    Pages picks `onRequestGet`/`onRequestPost` itself, so this normally never
+//    runs; forwarding means a request it hands to the catch-all anyway (a
+//    trailing slash, a future Pages routing change) still reaches the same
+//    code instead of falling through to a 405 that would be a lie.
 export async function onRequest(context) {
+  const { request } = context;
+  const pathname = new URL(request.url).pathname;
+  if (isRetiredLookupPath(pathname)) {
+    return json({ ok: false, error: "bad_request" }, 400);
+  }
+  if (isRegisterPath(pathname)) {
+    if (request.method === "GET") return onRequestGet(context);
+    if (request.method === "POST") return onRequestPost(context);
+  }
   return json({ ok: false }, 405);
 }

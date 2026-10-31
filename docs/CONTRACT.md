@@ -254,6 +254,7 @@ auto redirects, TLS via schannel (built in).
 ```rust
 pub fn get(url: &str) -> Res<Vec<u8>>;                 // GET, 2xx -> body; else Err("HTTP <code> for <url>")
 pub fn get_opt(url: &str) -> Res<Option<Vec<u8>>>;     // 404/403/410 -> Ok(None)
+pub fn get_with_status(url: &str, limit: usize) -> Res<(u32, Vec<u8>)>; // any status keeps its body
 pub fn download(url: &str, dest: &Path, sha1: &str, size: u64) -> Res<()>;
 pub fn download_many(items: &[Download]) -> Res<()>;   // ≤ 12 worker threads, aggregated progress
 pub struct Download { pub url: String, pub dest: PathBuf, pub sha1: String, pub size: u64, pub label: String }

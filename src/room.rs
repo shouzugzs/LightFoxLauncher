@@ -271,25 +271,56 @@ fn parse_lookup(body: &[u8]) -> Res<(RoomAddr, u16)> {
     Ok((checked_addr(addr)?, port as u16))
 }
 
+/// The URL a lookup is sent to. Split out so the *shape* of the route — the
+/// `code` query parameter, not a path segment — is pinned by a test rather
+/// than only by a live round trip.
+fn lookup_url(base: &str, code: &RoomCode) -> String {
+    format!("{base}/api/room?code={}", code.as_str())
+}
+
+/// Map `(status, body)` from the registry to the lookup result.
+///
+/// Kept separate from [`lookup`] so every branch is reachable in a test: the
+/// network only supplies the two values.
+fn parse_lookup_status(status: u32, body: &[u8]) -> Res<(RoomAddr, u16)> {
+    match status {
+        // The body decides among `ok`, `bad_code`, `bad_request` and
+        // `server_error`; a 200 is the only status whose body may carry an
+        // address, and `parse_lookup` validates it before it becomes a
+        // `RoomAddr`.
+        200 => parse_lookup(body),
+        // The registry answers 404 with `{"ok":false,"error":"not_found"}` for
+        // an expired or unknown room. The status is the contract; the body is
+        // not parsed, so a broken 404 page still reads as "not found".
+        404 => Err(explain("not_found")),
+        429 => Err(explain("rate_limited")),
+        // Everything else is the registry (or something in front of it)
+        // failing. The status is named so the report is diagnosable, but the
+        // body is not quoted: it can be any length and any language.
+        other => Err(format!("查询房号失败（HTTP {other}）")),
+    }
+}
+
 /// Look a room up and return the host's `(addr, port)`.
+///
+/// The code travels as the `code` **query parameter**, not as a path segment:
+/// the registry is a Cloudflare Pages Function, and Pages is a file router, so
+/// `site/functions/api/room.js` maps to `/api/room` only. `/api/room/ABC234`
+/// was answered by the static-asset 404 before any Function ran, which is the
+/// bug this shape fixes.
+///
+/// Failure handling goes through the **status**, never through the error
+/// string. `get_max` reports a non-2xx as `HTTP 404 for <url>` with the body
+/// discarded, and matching that text is how a CDN's HTML 404 page — or any
+/// other host that happens to answer 404 — gets mistranslated into "房号已过期".
+/// [`crate::net::get_with_status`] keeps `(status, body)`, so each status maps
+/// to one outcome and nothing is guessed from a message.
 pub fn lookup(server: &str, code: &RoomCode) -> Res<(RoomAddr, u16)> {
     let base = base_url(server)?;
-    let url = format!("{base}/api/room/{}", code.as_str());
-    let raw = match crate::net::get_max(&url, crate::net::POST_MAX_BODY) {
-        Ok(b) => b,
-        Err(e) => {
-            // 404 is the ordinary "expired" case and deserves its own wording;
-            // everything else keeps the transport error.
-            if e.contains("HTTP 404") {
-                return Err(explain("not_found"));
-            }
-            if e.contains("HTTP 429") {
-                return Err(explain("rate_limited"));
-            }
-            return Err(format!("查询房号失败：{e}"));
-        }
-    };
-    parse_lookup(&raw)
+    let url = lookup_url(&base, code);
+    let (status, raw) = crate::net::get_with_status(&url, crate::net::POST_MAX_BODY)
+        .map_err(|e| format!("查询房号失败：{e}"))?;
+    parse_lookup_status(status, &raw)
 }
 
 #[cfg(test)]
@@ -431,6 +462,57 @@ mod tests {
         assert!(lookup("", &c).is_err());
         assert!(lookup("not a url", &c).is_err());
         assert!(lookup("file:///etc/passwd", &c).is_err());
+    }
+
+    #[test]
+    fn lookup_url_puts_the_code_in_the_query_string() {
+        // The registry is a Pages Function, and Pages is a file router: only
+        // `/api/room` reaches `room.js`. A path segment never routes at all,
+        // so the code must be a query parameter — this test is the pin that
+        // stops a future edit from "tidying" it back into the path.
+        let c = RoomCode::parse("ABC234").unwrap();
+        let url = lookup_url("https://launcher.example", &c);
+        assert_eq!(url, "https://launcher.example/api/room?code=ABC234");
+        assert!(!url.contains("/api/room/"), "path-segment form is not routed: {url}");
+        // The code is always a validated uppercase 6-char string, so it needs
+        // no escaping and cannot inject a second parameter.
+        for good in ["ABC234", "XYZ789", "ZZZZZZ"] {
+            let c = RoomCode::parse(good).unwrap();
+            let url = lookup_url("https://h", &c);
+            assert_eq!(url.matches('?').count(), 1, "one query: {url}");
+            assert_eq!(url.matches('&').count(), 0, "one parameter: {url}");
+            assert!(url.ends_with(&format!("?code={good}")), "{url}");
+        }
+    }
+
+    #[test]
+    fn lookup_status_maps_without_string_matching() {
+        let ok_body = br#"{"ok":true,"addr":"1.2.3.4","port":25565}"#;
+        // 200 is the only status that yields an address.
+        let got = parse_lookup_status(200, ok_body).expect("200 ok");
+        assert_eq!(got.0.as_str(), "1.2.3.4");
+        assert_eq!(got.1, 25565);
+
+        // 404 means "expired or unknown" — and it means that because of the
+        // number, not because the body looked like JSON. An HTML error page
+        // from a CDN in front of the registry must not become a panic or a
+        // bogus address.
+        let e = parse_lookup_status(404, b"<html>Not Found</html>").unwrap_err();
+        assert!(e.contains("过期"), "{e}");
+        // 429 is the rate limit, again by status alone.
+        let e = parse_lookup_status(429, b"").unwrap_err();
+        assert!(e.contains("频繁"), "{e}");
+        // Anything else is a plain failure that names the status.
+        for status in [500u32, 502, 503, 301, 403] {
+            let e = parse_lookup_status(status, b"").unwrap_err();
+            assert!(e.contains(&format!("HTTP {status}")), "{status} -> {e}");
+            // The raw body is never quoted back at the user.
+            assert!(!e.contains("<html>"), "{status} -> {e}");
+        }
+        // A 200 whose body is the error enum still reports the enum, so a
+        // registry that answers 200 for a bad code is handled too.
+        let e = parse_lookup_status(200, br#"{"ok":false,"error":"bad_code"}"#).unwrap_err();
+        assert!(e.contains("格式"), "{e}");
     }
 
     #[test]

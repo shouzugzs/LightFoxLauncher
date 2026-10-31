@@ -70,7 +70,12 @@ Pages 自动构建并发布。每一次变更都在 git 历史里，可审计、
 | 端点 | 作用 |
 |---|---|
 | `POST /api/room` | 注册/续期，body `{"code","addr","port"}` |
-| `GET /api/room/<CODE>` | 查询，返回 `{"ok":true,"addr","port"}` |
+| `GET /api/room?code=<CODE>` | 查询，返回 `{"ok":true,"addr","port"}` |
+
+房号走**查询参数**而不是路径段：Pages 是文件路由，`site/functions/api/room.js`
+只映射到 `/api/room`，`/api/room/<CODE>` 会被静态 404 直接接走，根本到不了
+Function。旧路径形式现在返回 `400 bad_request`（不是 405，也不是 404），
+免得和"房号过期"混淆。
 
 * 房号 6 字符，字母表 `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` —— 剔除 `I/O/0/1`，
   因为房号是念出来或看截图输入的，这四个最容易被听错/看错；

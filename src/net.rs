@@ -879,6 +879,29 @@ pub fn post_json(url: &str, json: &str) -> Res<(u32, Vec<u8>)> {
     Ok((status, body))
 }
 
+/// GET a small document and return `(status, body)` for **any** status.
+///
+/// [`get_max`] turns a non-2xx into an `Err`, which throws the body away — and
+/// the body is where a JSON API puts its machine-readable reason. A caller that
+/// has to tell "the room expired" (404 + `{"error":"not_found"}`) from "the
+/// host is down" (a transport error) cannot do it from the error string
+/// alone: `HTTP 404` in a message is indistinguishable from an HTML error page
+/// served by a CDN. Returning the status next to the body makes that a match
+/// on a number the server actually sent.
+///
+/// The body is still capped, and the cap is enforced while it arrives: a
+/// hostile endpoint gets a few kilobytes of our memory, not a document. A
+/// status that is not 2xx is *not* an error here, so an error return means the
+/// request never produced a response at all.
+pub fn get_with_status(url: &str, limit: usize) -> Res<(u32, Vec<u8>)> {
+    let u = Url::parse(url)?;
+    let (s, status) = open_with_status(&u)?;
+    let body = s
+        .read_all(limit, Some(Instant::now() + DOC_DEADLINE))
+        .map_err(|e| format!("{e} ({url})"))?;
+    Ok((status, body))
+}
+
 /// GET a small document; `Ok(None)` for 403/404/410.
 pub fn get_opt(url: &str) -> Res<Option<Vec<u8>>> {
     let u = Url::parse(url)?;
@@ -1586,10 +1609,30 @@ mod tests {
         assert!(e.contains("nonsense"), "must name url: {e}");
         let e = get_opt("gopher://h/f").unwrap_err();
         assert!(e.contains("gopher://h/f"), "must name url: {e}");
+        let e = get_with_status("nonsense", POST_MAX_BODY).unwrap_err();
+        assert!(e.contains("nonsense"), "must name url: {e}");
+        let e = get_with_status("gopher://h/f", POST_MAX_BODY).unwrap_err();
+        assert!(e.contains("gopher://h/f"), "must name url: {e}");
         // Bad requests use the common errors-offline path: no network needed
         // because URL validation fails first.
         let e = download("bad url", Path::new("x.bin"), "", 0).unwrap_err();
         assert!(e.contains("bad url"), "must name url: {e}");
+    }
+
+    #[test]
+    fn get_with_status_keeps_the_body_of_a_non_2xx() {
+        // The point of the function: `get_max` errors out on 404 and the body
+        // (the JSON `{"error":"not_found"}`) is lost, so a caller cannot tell a
+        // real registry answer from an HTML error page. Here the status comes
+        // back as a number and the body is still there. No network: a URL that
+        // fails validation proves the plumbing, and the live counterpart below
+        // exercises the 404 path against a real server.
+        let e = get_with_status("http://", POST_MAX_BODY).unwrap_err();
+        assert!(e.starts_with("net: "), "must be a net error: {e}");
+        // The status is `u32` and the body `Vec<u8>`, matching `post_json`;
+        // this compiles only while that stays true.
+        fn _shape(f: fn(&str, usize) -> Res<(u32, Vec<u8>)>) {}
+        _shape(get_with_status);
     }
 
     #[test]
@@ -1837,6 +1880,11 @@ mod tests {
         assert!(get_opt(missing).expect("get_opt").is_none());
         let e = get(missing).unwrap_err();
         assert!(e.contains("HTTP 404"), "unexpected error: {e}");
+        // The same 404, but with the status and body kept, which is what a
+        // JSON caller needs.
+        let (status, body) = get_with_status(missing, POST_MAX_BODY).expect("status");
+        assert_eq!(status, 404, "unexpected status");
+        assert!(!body.is_empty(), "a 404 body should still be readable");
 
         let dest = std::env::temp_dir().join(format!("lfl-live-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&dest);
