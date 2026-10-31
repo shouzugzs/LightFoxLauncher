@@ -150,6 +150,10 @@ const ID_HOST_PORT: i32 = 756;
 const ID_HOST_STATUS: i32 = 757;
 const ID_HOST_INFO: i32 = 758;
 const ID_HOST_JOIN: i32 = 759;
+const ID_HOST_ROOM: i32 = 760;
+const ID_HOST_ROOM_NEW: i32 = 761;
+const ID_HOST_ROOM_JOIN: i32 = 762;
+const ID_HOST_ROOM_COPY: i32 = 763;
 
 const TIMER_UI: usize = 1;
 const WM_APP_LOG: UINT = WM_APP + 1;
@@ -315,6 +319,11 @@ struct App {
     host_close: HWND,
     host_copy: HWND,
     host_addr: HWND,
+    /// Room-code controls: the code box plus host/join/copy buttons.
+    host_room: HWND,
+    host_room_new: HWND,
+    host_room_join: HWND,
+    host_room_copy: HWND,
     host_port: HWND,
     host_status: HWND,
     host_info: HWND,
@@ -483,6 +492,10 @@ impl App {
             host_close: std::ptr::null_mut(),
             host_copy: std::ptr::null_mut(),
             host_addr: std::ptr::null_mut(),
+            host_room: std::ptr::null_mut(),
+            host_room_new: std::ptr::null_mut(),
+            host_room_join: std::ptr::null_mut(),
+            host_room_copy: std::ptr::null_mut(),
             host_port: std::ptr::null_mut(),
             host_status: std::ptr::null_mut(),
             host_info: std::ptr::null_mut(),
@@ -842,6 +855,9 @@ unsafe extern "system" fn wnd_proc(
                 ID_HOST_OPEN if code == BN_CLICKED => host_open_now(app),
                 ID_HOST_CLOSE if code == BN_CLICKED => host_close_now(app),
                 ID_HOST_COPY if code == BN_CLICKED => host_copy_addr(app),
+                ID_HOST_ROOM_NEW if code == BN_CLICKED => host_room_new(app),
+                ID_HOST_ROOM_JOIN if code == BN_CLICKED => host_room_join(app),
+                ID_HOST_ROOM_COPY if code == BN_CLICKED => host_room_copy(app),
                 ID_NOTIFY_LIST if code == LBN_SELCHANGE => notify_selection_changed(app),
                 ID_SRCH_BTN if code == BN_CLICKED => search_run(app),
                 ID_SRCH_DL if code == BN_CLICKED => search_download(app),
@@ -1786,6 +1802,19 @@ fn build_host_page(app: &mut App) {
             WS_EX_CLIENTEDGE,
         );
         app.host_status = child(app.hwnd, "STATIC", "", DT_LEFT, ID_HOST_STATUS, 0);
+        // Room-code row: a code box the user reads/writes, plus the three
+        // actions that turn a code into a connection.
+        app.host_room = child(
+            app.hwnd,
+            "EDIT",
+            "",
+            WS_TABSTOP | ES_AUTOHSCROLL | ES_UPPERCASE,
+            ID_HOST_ROOM,
+            WS_EX_CLIENTEDGE,
+        );
+        app.host_room_new = child(app.hwnd, "BUTTON", "建房号", WS_TABSTOP, ID_HOST_ROOM_NEW, 0);
+        app.host_room_join = child(app.hwnd, "BUTTON", "用房间号连接", WS_TABSTOP, ID_HOST_ROOM_JOIN, 0);
+        app.host_room_copy = child(app.hwnd, "BUTTON", "复制房号", WS_TABSTOP, ID_HOST_ROOM_COPY, 0);
         app.host_info = child(
             app.hwnd,
             "EDIT",
@@ -1802,6 +1831,10 @@ fn build_host_page(app: &mut App) {
             app.host_copy,
             app.host_addr,
             app.host_status,
+            app.host_room,
+            app.host_room_new,
+            app.host_room_join,
+            app.host_room_copy,
             app.host_info,
         ];
         for h in &app.host_ctl {
@@ -1971,6 +2004,136 @@ fn host_copy_addr(app: &App) {
         Ok(()) => set_host_status(app, "地址已复制到剪贴板。"),
         Err(e) => set_host_status(app, &format!("复制失败：{e}")),
     }
+}
+
+// ---- room codes -----------------------------------------------------------
+
+/// The room server to use: the settings value, or the built-in default.
+fn room_server(app: &App) -> String {
+    app.settings
+        .room_server
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| lightfox::room::DEFAULT_SERVER.to_string())
+}
+
+/// "建房号": pick a fresh code, map it to this machine's address, and show it.
+///
+/// Registration needs a reachable address, so the user must have run 开服 (or
+/// at least 检测网络) first — the address box is the source of truth, which
+/// keeps the room pointing at whatever was actually advertised.
+fn host_room_new(app: &mut App) {
+    let addr = window_text(app.host_addr);
+    let Some((ip, port)) = first_shareable_addr(&addr) else {
+        set_host_status(app, "先点“检测网络”或“开服”，有了可分享的地址才能建房号。");
+        return;
+    };
+    let code = lightfox::room::RoomCode::generate();
+    let server = room_server(app);
+    // Show the code immediately so it can be read out even if registration
+    // fails; the status line says whether it is live.
+    unsafe {
+        let w = wide(code.as_str());
+        SetWindowTextW(app.host_room, w.as_ptr());
+    }
+    let c2 = code.clone();
+    host_spawn(app, port, move |_p| {
+        let mut r = lightfox::hosting::HostReport::default();
+        match lightfox::room::register(&server, &c2, &ip, port) {
+            Ok(ttl) => {
+                r.notes.push(format!("房间号 {} 已上线（{}:{port}）。", c2.as_str(), ip));
+                r.notes.push(format!(
+                    "有效期约 {} 分钟；启动器运行期间每 5 分钟自动续期。",
+                    ttl / 60
+                ));
+                r.notes.push("把房号告诉朋友，他们在同一页输入房号点“用房间号连接”。".to_string());
+            }
+            Err(e) => {
+                r.notes.push(format!("房间号 {} 注册失败：{e}", c2.as_str()));
+                r.notes.push("房号已生成但未生效；检查网络或稍后重试。".to_string());
+            }
+        }
+        r
+    });
+}
+
+/// "用房间号连接": look the code up and put the host's address in the box.
+fn host_room_join(app: &mut App) {
+    let raw = window_text(app.host_room);
+    let code = match lightfox::room::RoomCode::parse(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            set_host_status(app, &format!("房号无效：{e}"));
+            return;
+        }
+    };
+    let server = room_server(app);
+    host_spawn(app, host_port_of(app), move |_p| {
+        let mut r = lightfox::hosting::HostReport::default();
+        match lightfox::room::lookup(&server, &code) {
+            Ok((addr, port)) => {
+                // Format as a connectable address; IPv6 needs brackets, and the
+                // server returns the bare address, so re-bracket when it has a
+                // colon but no brackets already.
+                let shown = if addr.contains(':') && !addr.starts_with('[') {
+                    format!("[{addr}]:{port}")
+                } else {
+                    format!("{addr}:{port}")
+                };
+                r.notes.push(format!("房号 {} → {shown}", code.as_str()));
+                r.notes.push("在游戏的“多人游戏 → 直接连接”里输入上面的地址。".to_string());
+                r.v6_addresses = vec![shown];
+            }
+            Err(e) => {
+                r.notes.push(format!("查询房号 {} 失败：{e}", code.as_str()));
+            }
+        }
+        r
+    });
+}
+
+/// "复制房号": the code alone, which is what gets sent to friends.
+fn host_room_copy(app: &App) {
+    let code = window_text(app.host_room);
+    if code.trim().is_empty() {
+        set_host_status(app, "还没有房号，先点“建房号”。");
+        return;
+    }
+    match set_clipboard(code.trim()) {
+        Ok(()) => set_host_status(app, "房号已复制，发给朋友即可。"),
+        Err(e) => set_host_status(app, &format!("复制失败：{e}")),
+    }
+}
+
+/// Pull the first usable `addr:port` out of the address box.
+///
+/// The box holds one address per line (IPv6 first, then mapped IPv4), each
+/// written as `[v6]:port` or `v4:port`. This returns the first parseable pair.
+fn first_shareable_addr(text: &str) -> Option<(String, u16)> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('（') {
+            continue;
+        }
+        // [v6]:port
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some((ip, tail)) = rest.split_once(']') {
+                if let Some(port) = tail.strip_prefix(':').and_then(|p| p.trim().parse::<u16>().ok()) {
+                    return Some((ip.to_string(), port));
+                }
+            }
+            continue;
+        }
+        // v4:port — the last colon separates the port.
+        if let Some((ip, port)) = line.rsplit_once(':') {
+            if let Ok(p) = port.trim().parse::<u16>() {
+                if ip.contains('.') {
+                    return Some((ip.to_string(), p));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn build_controls(app: &mut App) {
@@ -2443,9 +2606,8 @@ fn layout(app: &App) {
             }
             7 => {
                 // 联机: one card (detect / open / port / close / copy / status),
-                // then the shareable address on the left and the explanation
-                // panel on the right — mirroring the 通知 page's two-column
-                // tail so the pages read as siblings.
+                // a second row for room codes, then the shareable address on
+                // the left and the explanation panel on the right.
                 let b = content_y(top, true);
                 MoveWindow(app.host_detect, cx, b, 100, ROW_H, 1);
                 MoveWindow(app.host_open, cx + 108, b, 130, ROW_H, 1);
@@ -2453,7 +2615,14 @@ fn layout(app: &App) {
                 MoveWindow(app.host_port, cx + 354, b, 80, ROW_H, 1);
                 MoveWindow(app.host_copy, cx + 442, b, 100, ROW_H, 1);
                 MoveWindow(app.host_status, cx + 550, b + 3, cw_in - 550, 22, 1);
-                let card_bottom = card_end(top, 2, true);
+
+                // Room-code row: the code box takes the slack.
+                let b2 = row_y(b, 1);
+                MoveWindow(app.host_room_new, cx, b2, 90, ROW_H, 1);
+                MoveWindow(app.host_room_join, cx + 98, b2, 130, ROW_H, 1);
+                MoveWindow(app.host_room_copy, cx + 236, b2, 90, ROW_H, 1);
+                MoveWindow(app.host_room, cx + 334, b2, 140, ROW_H, 1);
+                let card_bottom = card_end(top, 3, true);
 
                 let lt = card_bottom + CARD_PAD;
                 let lh = (ch - lt - CARD_PAD - PAD).max(80);
@@ -3493,6 +3662,8 @@ fn save_settings(app: &mut App) {
         // Also owned by the 通知 page. Preserved rather than defaulted, or a
         // 设置-page save would reset the one-time consent and re-ask next start.
         feed_prompted: app.settings.feed_prompted,
+        // Owned by the 联机 page; preserved for the same reason as above.
+        room_server: app.settings.room_server.clone(),
     };
     if let Err(e) = new.validate() {
         app.message("设置无效", &e);

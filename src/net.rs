@@ -140,6 +140,11 @@ pub const TOO_LARGE: &str = "document exceeds the size cap";
 /// 60 s is far beyond any legitimate metadata fetch and short enough that a
 /// wedged fetch is recoverable.
 const DOC_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Cap on a [`post_json`] response body. The room registry answers in well
+/// under a kilobyte; 4 KiB leaves room for an error document without letting a
+/// hostile endpoint stream anything large.
+pub const POST_MAX_BODY: usize = 4 * 1024;
 /// Streaming chunk (contract: 256 KiB).
 const CHUNK: usize = 256 * 1024;
 /// Total attempts per file (contract: 3).
@@ -541,6 +546,16 @@ impl Session {
 
     /// Same as [`Session::open`], adding raw request headers (e.g. `Range`).
     fn open_with(url: &Url, headers: Option<&str>) -> Res<Session> {
+        Session::open_req(url, "GET", headers, None)
+    }
+
+    /// Open a request with an explicit verb and optional body.
+    ///
+    /// `headers` is a raw header block (`"X: y\r\n"`); `body` is sent as the
+    /// request body with `total_len` set so WinHTTP frames it correctly. Only
+    /// small JSON payloads are sent this way (the room registry), so the body
+    /// is buffered rather than streamed.
+    fn open_req(url: &Url, verb: &str, headers: Option<&str>, body: Option<&[u8]>) -> Res<Session> {
         // Defence in depth. `Url::parse` already refuses a control character in
         // host or path, but `Url`'s fields are `pub`, so a caller (or a future
         // refactor) can build one directly and hand it here. Both values end up
@@ -636,13 +651,13 @@ impl Session {
         }
         let connect = Handle(connect);
 
-        let verb = util::to_wide("GET");
+        let verb_wide = util::to_wide(verb);
         let path = util::to_wide(&url.path);
         let flags = if url.secure { FLAG_SECURE } else { 0 };
         let request = unsafe {
             WinHttpOpenRequest(
                 connect.0,
-                verb.as_ptr(),
+                verb_wide.as_ptr(),
                 path.as_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
@@ -668,11 +683,24 @@ impl Session {
             None => (std::ptr::null(), 0),
         };
         let ok = unsafe {
-            WinHttpSendRequest(request.0, hdr_ptr, hdr_len, std::ptr::null(), 0, 0, 0)
+            match body {
+                // With a body, `total_len` must be its exact length so WinHTTP
+                // sends Content-Length itself rather than a chunked stream.
+                Some(b) => WinHttpSendRequest(
+                    request.0,
+                    hdr_ptr,
+                    hdr_len,
+                    b.as_ptr() as *mut Void,
+                    b.len() as u32,
+                    b.len() as u32,
+                    0,
+                ),
+                None => WinHttpSendRequest(request.0, hdr_ptr, hdr_len, std::ptr::null(), 0, 0, 0),
+            }
         };
         if ok == 0 {
             return Err(format!(
-                "net: sending GET {}{} failed: {}",
+                "net: sending {verb} {}{} failed: {}",
                 url.host,
                 url.path,
                 describe_error(last_error())
@@ -827,6 +855,28 @@ pub fn get_max(url: &str, limit: usize) -> Res<Vec<u8>> {
     }
     s.read_all(limit, Some(Instant::now() + DOC_DEADLINE))
         .map_err(|e| format!("{e} ({url})"))
+}
+
+/// POST a small JSON document and return `(status, body)`.
+///
+/// Status is returned rather than treated as an error so the caller can map a
+/// 404 to "the room is gone" instead of a generic failure. The body cap is
+/// small on purpose: the room registry answers in a few dozen bytes, and a
+/// hostile endpoint must not be able to make the launcher buffer a document.
+pub fn post_json(url: &str, json: &str) -> Res<(u32, Vec<u8>)> {
+    let u = Url::parse(url)?;
+    // Reject anything that is not already JSON: the only caller serialises a
+    // fixed shape, and a stray control character here would go on the wire.
+    if json.chars().any(|c| c.is_control()) {
+        return Err("net: refusing to POST a body with control characters".to_string());
+    }
+    let headers = "Content-Type: application/json\r\nAccept: application/json\r\n";
+    let s = Session::open_req(&u, "POST", Some(headers), Some(json.as_bytes()))?;
+    let status = s.status()?;
+    let body = s
+        .read_all(POST_MAX_BODY, Some(Instant::now() + DOC_DEADLINE))
+        .map_err(|e| format!("{e} ({url})"))?;
+    Ok((status, body))
 }
 
 /// GET a small document; `Ok(None)` for 403/404/410.

@@ -1,6 +1,6 @@
 # LightFoxLauncher — a minimal Minecraft launcher in Rust
 
-Version 0.3.2 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
+Version 0.4.1 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 [![Licence: MPL-2.0](https://img.shields.io/badge/licence-MPL--2.0-brightgreen)](LICENSE)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-blue)](Cargo.lock)

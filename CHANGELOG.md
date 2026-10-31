@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.4.1
+
+联机（play together）— IPv6/IPv4 direct hosting plus a room-code shortcut so
+nobody has to read out a 39-character IPv6 address.
+
+### Added
+
+* **联机 page** (eighth tab). 检测网络 reports what this machine can host:
+  globally-routable IPv6 addresses, the IPv4 gateway, and whether the firewall
+  rule exists. Read-only — it changes nothing.
+* **开服（映射端口）** — adds the firewall rule, then tries a port mapping:
+  UPnP IGD first (SSDP discovery → device description → SOAP AddPortMapping),
+  falling back to NAT-PMP (RFC 6886) only when UPnP found no gateway at all. A
+  4-hour lease, with a retry as a permanent lease when the router answers
+  error 725. 关闭映射 tears the mapping down again.
+* **房间号** — a 6-character code (32-symbol alphabet, no I/0/1 lookalikes)
+  maps to the host's address for 10 minutes, so friends type `ABC234` instead
+  of an IPv6 address. 建房号 registers, 用房间号连接 looks up, 复制房号 copies.
+  The registry is a Cloudflare Pages Function over KV; it stores only
+  `code → addr:port` and never proxies game traffic.
+* `servermod` — server.jar download (sha1-verified), `eula.txt`,
+  `server.properties` (`online-mode=false` and `enforce-secure-profile=false`
+  with reasons), and `whitelist.json` built from offline-mode UUIDs.
+* `hash::offline_uuid` + MD5: offline-mode UUIDs are
+  `MD5("OfflinePlayer:" + name)` with UUID-v3 version/variant bits. A premium
+  UUID in the whitelist does **not** match on an offline server, so the
+  launcher generates the right ones.
+* `Settings.room_server` — optional override for the room registry; the
+  built-in default is used when unset.
+
+### Security notes
+
+* The room registry validates the code against a strict 32-symbol alphabet and
+  the address against an IPv6/IPv4 character set before storing either, so a
+  hostile client cannot inject into KV keys or the stored JSON.
+* Rate limits: 10 registrations/minute and 60 lookups/minute per IP. Room
+  entries expire after 10 minutes.
+* UPnP/NAT-PMP responses are only accepted from the default gateway — a
+  spoofed reply would otherwise be a mapping-injection primitive.
+* The launcher is offline-mode only, so hosting exposes the server to anyone
+  with the address. The 联机 page says so and the generated
+  `server.properties` enables the whitelist.
+
 ## 0.3.2
 
 Security round 3, aimed at one feature end to end: the 通知 page and the

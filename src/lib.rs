@@ -39,6 +39,7 @@ pub mod natpmp;
 pub mod net;
 pub mod notify;
 pub mod profiles;
+pub mod room;
 pub mod settings;
 pub mod servermod;
 pub mod util;

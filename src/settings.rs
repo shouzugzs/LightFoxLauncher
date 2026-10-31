@@ -63,6 +63,14 @@ pub struct Settings {
     /// user has never been asked", and would either nag on every start or never
     /// ask at all.
     pub feed_prompted: bool,
+    /// Room-code server for the 联机 page. `None` uses the built-in default
+    /// ([`crate::room::DEFAULT_SERVER`]); an empty string also means default.
+    ///
+    /// Separate from `feed_url` because the two are unrelated services: a user
+    /// may want announcements from one host and rooms from another, and the
+    /// room server is only ever contacted when the user presses 建房号 or
+    /// 用房间号连接 — never on startup.
+    pub room_server: Option<String>,
 }
 
 impl Default for Settings {
@@ -79,6 +87,7 @@ impl Default for Settings {
             // Off until the user is asked once and says yes; see `feed_prompted`.
             check_feed: false,
             feed_prompted: false,
+            room_server: None,
         }
     }
 }
@@ -128,6 +137,7 @@ impl Settings {
                     out.feed_prompted = v != "0";
                     saw_prompted = true;
                 }
+                "room_server" if !v.is_empty() => out.room_server = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -166,7 +176,8 @@ impl Settings {
              progress={}\n\
              feed_url={}\n\
              check_feed={}\n\
-             feed_prompted={}\n",
+             feed_prompted={}\n\
+             room_server={}\n",
             self.workers,
             one_line(&self.java.clone().unwrap_or_default()),
             one_line(&self.memory),
@@ -177,6 +188,7 @@ impl Settings {
             one_line(&self.feed_url.clone().unwrap_or_default()),
             self.check_feed as u8,
             self.feed_prompted as u8,
+            one_line(&self.room_server.clone().unwrap_or_default()),
         );
         let target = Settings::file(dir);
         let tmp = dir.join("lfl-settings.ini.tmp");
@@ -293,6 +305,7 @@ mod tests {
             feed_url: Some("https://example.invalid/feed.json".to_string()),
             check_feed: false,
             feed_prompted: true,
+            room_server: Some("https://rooms.example".to_string()),
         };
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);
