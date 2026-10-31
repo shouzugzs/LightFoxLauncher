@@ -61,24 +61,27 @@ Pages 自动构建并发布。每一次变更都在 git 历史里，可审计、
 发布新版本时：更新 `latest`、把新版本说明作为一条 note 加到数组**前面**
 （启动器按顺序显示），保留旧 note 若干条以便老启动器仍能看到历史。
 
-## 蜜罐
+## 蜜罐（私有部署，不在公开仓库）
 
-`site/admin/`、`site/panel/`、`site/wp-admin/` 是一组**假管理后台**，带防御性
-捕获能力：
+蜜罐由两部分组成，**两部分都不在公开仓库里**：
 
-* 页面像登录框，表单提交到 `/api/login`；
-* `/api/login` 是一个 Cloudflare Pages Function（`site/functions/api/login.js`），
-  它把每次提交记录为一条事件写入 KV 绑定 `HP`，然后返回千篇一律的
-  `500 {"ok":false}` —— 不回显、不计数、不区分成功与失败，攻击者得不到任何
-  反馈；
+* `private-site/admin/`、`private-site/panel/`、`private-site/wp-admin/` —
+  假管理后台页面；
+* `private-site/functions/api/login.js` — 捕获端点 `/api/login`，把每次提交
+  记录为一条事件写入 KV 绑定 `HP`，然后返回千篇一律的 `500 {"ok":false}` —
+  不回显、不计数、不区分成功与失败，攻击者得不到任何反馈；
 * 每条事件包含：UTC 时间、来源 IP（`CF-Connecting-IP`，XFF 只作补充记录）、
   User-Agent、提交的字段（用户名/密码/来源页）、请求头白名单、CF ray/colo/
   国家/ASN。响应与存储里都不含 cookie，不捕获会话；
 * 单事件 ≤4 KB、超长截断；单 IP 每小时 ≤20 条（KV 计数器限流）；事件保留
-  30 天后自动过期；
-* `robots.txt` 列出这些路径 — 这是有意的：爬虫与漏洞扫描器会顺着进来，真人
-  几乎不会。这些链接以隐藏方式挂在 index.html 页脚（`display:none`），只对
-  解析 HTML 找链接的自动化工具可见。
+  30 天后自动过期。
+
+**为什么私有**：蜜罐源码一旦公开，扫描器 grep 一下页面特征或直接看仓库就
+知道这是假后台，捕获即失效。所以 `private-site/` 在 `.gitignore` 里，只存在
+于本机，用 wrangler 直接部署；公开仓库里只有介绍站和 feed.json，且
+`site/index.html` 的页脚隐藏链接与 robots.txt 提示都已移除——公开侧不存在
+任何指向蜜罐的线索，蜜罐路径只有攻击者主动扫描才会发现（这对捕获更有利：
+来的人都是真的在扫）。
 
 ### 隐私与边界
 
@@ -103,15 +106,38 @@ node tools/honeypot-export.mjs --delete
 
 ### KV 绑定配置（部署时一次性）
 
-Cloudflare Dashboard → 该 Pages 项目 → Settings → Functions → KV namespace
-bindings：新建/选择一个 namespace，绑定变量名填 `HP`。或者：
-
 ```bash
 npx wrangler kv namespace create HP
-# 按输出提示把 namespace_id 绑定到 Pages 项目（Dashboard 或 wrangler pages ...）
+# 输出里有 namespace id，填进 private-site/wrangler.toml 的 [[kv_namespaces]] id=
 ```
 
 未绑定 `HP` 时端点返回同样的 500，蜜罐页面照常工作，只是不落盘。
+
+### 蜜罐单独部署（wrangler，从本机直传）
+
+蜜罐部署为**独立的 Pages 项目**，与介绍站分离：一个从 GitHub 自动构建
+（公开），一个从本机 wrangler 直传（私有、不进任何仓库）。
+
+```bash
+# 一次性
+npm i -g wrangler && wrangler login
+npx wrangler kv namespace create HP        # 把 id 填进 private-site/wrangler.toml
+
+# 部署/更新蜜罐（private-site/public/ 是静态页，functions/ 是捕获端点）
+cd private-site
+mkdir -p public
+cp -r admin panel wp-admin public/          # Windows PowerShell: Copy-Item -Recurse
+npx wrangler pages deploy public --project-name lightfox-honeypot
+```
+
+首次 `deploy` 会询问项目名与生产分支，按上面给的名字即可。部署完成后
+蜜罐在 `https://lightfox-honeypot.pages.dev` 独立可用；如果想让蜜罐与介绍站
+同域（路径形态更像真实站点），改用自定义域：给两个项目分别绑定同一域名的
+不同子域，或在介绍站项目里把 `/admin` 等路径反代到蜜罐项目——后两者是
+可选优化，初始部署不需要。
+
+验证：`curl -X POST -d "u=1&p=2" https://lightfox-honeypot.pages.dev/api/login`
+应返回 `{"ok":false}`，KV 里出现一条 `hit:` 事件。
 
 ## 边界声明
 
@@ -119,5 +145,7 @@ npx wrangler kv namespace create HP
 * 启动器默认**不启用**通知功能，首次启动会询问一次，默认答案为否；
 * 启动器对 `http://` 地址会提示明文风险；`feed.json` 应始终通过 `https://`
   分发（pages.dev 默认即 HTTPS）；
-* `/api/login` 是站点唯一的动态端点，只写不读、无任何查询能力；如果未来
-  需要更多动态能力，应重新评估而非就地加接口。
+* 蜜罐端点是蜜罐项目唯一的动态端点，只写不读、无任何查询能力；介绍站
+  本身保持纯静态、零后端；
+* 蜜罐源码与捕获配置只存在于本机 `private-site/`（gitignored），不进入
+  任何仓库；如果未来需要动态能力，应重新评估而非就地加接口。
