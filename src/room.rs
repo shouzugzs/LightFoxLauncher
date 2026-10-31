@@ -197,20 +197,36 @@ pub fn register(server: &str, code: &RoomCode, addr: &str, port: u16) -> Res<u64
     ))
 }
 
-/// Check an address the registry returned before it reaches a connect box.
+
+/// A host address that passed [`checked_addr`].
 ///
-/// The response is remote data, and the launcher both **shows** it (a status
-/// line the GUI formats with `\n` between lines) and offers it as the address
-/// to connect to. A newline in it therefore forges a whole extra status line —
-/// `"1.2.3.4\n[已上线] …"` renders as two lines, the second one not written by
-/// the launcher — and a value with a space or a quote ends up in a
-/// `host:port` string nobody can connect to.
+/// This is a newtype rather than a bare `String` so the validation cannot be
+/// bypassed by accident: [`lookup`] returns `RoomAddr`, and the only way to
+/// build one is [`checked_addr`] (the field is private to this module). A
+/// future edit that tries to hand back an unvalidated string — the one
+/// mutation the tests alone would not catch — fails to compile instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomAddr(String);
+
+impl RoomAddr {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for RoomAddr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Validate a host address from the registry.
 ///
-/// The registry's own validation (`site/functions/api/room.js`) is an
-/// allowlist of `[0-9A-Fa-f:.[]]`, but this client must not depend on a
-/// deployment behaving: the check is repeated here, and it is the same
-/// allowlist, so nothing legitimate is lost.
-fn checked_addr(addr: &str) -> Res<String> {
+/// The registry's own check (`site/functions/api/room.js`, `ADDR_RE`) is an
+/// allowlist of `[0-9A-Fa-f:.[]]`, but a client must not depend on a
+/// deployment behaving: this repeats the same allowlist, so nothing
+/// legitimate is lost and a compromised registry gains nothing.
+fn checked_addr(addr: &str) -> Res<RoomAddr> {
     if addr.is_empty() {
         return Err("查询房号：响应中的地址为空".to_string());
     }
@@ -226,7 +242,7 @@ fn checked_addr(addr: &str) -> Res<String> {
     {
         return Err(format!("查询房号：响应中的地址包含非法字符 {c:?}"));
     }
-    Ok(addr.to_string())
+    Ok(RoomAddr(addr.to_string()))
 }
 
 /// Turn a registry lookup response into `(addr, port)`.
@@ -234,7 +250,7 @@ fn checked_addr(addr: &str) -> Res<String> {
 /// Split out of [`lookup`] so the whole response path — `ok` handling, the
 /// error enum, the port range and the address allowlist — is testable without
 /// a network, the same way `notify::parse` is.
-fn parse_lookup(body: &[u8]) -> Res<(String, u16)> {
+fn parse_lookup(body: &[u8]) -> Res<(RoomAddr, u16)> {
     let json = parse_reply(body, "查询房号")?;
     let ok = json.str_at("ok") == Some("true")
         || json.path(&["ok"]).and_then(|v| v.as_bool()) == Some(true);
@@ -256,7 +272,7 @@ fn parse_lookup(body: &[u8]) -> Res<(String, u16)> {
 }
 
 /// Look a room up and return the host's `(addr, port)`.
-pub fn lookup(server: &str, code: &RoomCode) -> Res<(String, u16)> {
+pub fn lookup(server: &str, code: &RoomCode) -> Res<(RoomAddr, u16)> {
     let base = base_url(server)?;
     let url = format!("{base}/api/room/{}", code.as_str());
     let raw = match crate::net::get_max(&url, crate::net::POST_MAX_BODY) {
@@ -436,11 +452,32 @@ mod tests {
     }
 
     #[test]
+    fn room_addr_can_only_be_built_through_the_check() {
+        // The regression this guards is not a behaviour but a **type**: the
+        // one way to get an unvalidated address into the GUI was for a future
+        // edit to hand back a bare String from lookup(). RoomAddr has a
+        // private field, so that edit does not compile. What is testable here
+        // is the invariant the type carries: every RoomAddr that exists has
+        // been through the allowlist.
+        let ok = checked_addr("2001:db8::1").expect("valid address accepted");
+        assert_eq!(ok.as_str(), "2001:db8::1");
+        assert_eq!(format!("{ok}"), "2001:db8::1");
+        // And the constructor refuses what the GUI must never render.
+        for bad in ["1.2.3.4\n[已上线]", "1.2.3.4 x", "a\"b", ""] {
+            assert!(
+                checked_addr(bad).is_err(),
+                "{bad:?} must not become a RoomAddr"
+            );
+        }
+    }
+
+    #[test]
     fn lookup_response_is_parsed_through_the_address_check() {
         // The real response path, so removing the `checked_addr` call from
         // `lookup` fails here rather than silently shipping.
         let good = parse_lookup(br#"{"ok":true,"addr":"2001:db8::1","port":25565}"#).unwrap();
-        assert_eq!(good, ("2001:db8::1".to_string(), 25565));
+        assert_eq!(good.0.as_str(), "2001:db8::1");
+        assert_eq!(good.1, 25565);
 
         // A hostile record reaches the same path a real one does. The newline
         // must arrive as a JSON **escape**: `json.rs` rejects a raw control
@@ -506,7 +543,7 @@ mod tests {
             "[::1]",
             "192.168.1.10",
         ] {
-            assert_eq!(checked_addr(good).unwrap(), good, "{good:?} must be kept");
+            assert_eq!(checked_addr(good).unwrap().as_str(), good, "{good:?} must be kept");
         }
     }
 
@@ -519,7 +556,7 @@ mod tests {
         let ttl = register(DEFAULT_SERVER, &code, "127.0.0.1", 25565).expect("register");
         assert!(ttl >= 60, "ttl looks wrong: {ttl}");
         let (addr, port) = lookup(DEFAULT_SERVER, &code).expect("lookup");
-        assert_eq!(addr, "127.0.0.1");
+        assert_eq!(addr.as_str(), "127.0.0.1");
         assert_eq!(port, 25565);
     }
 }

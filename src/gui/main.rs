@@ -2073,12 +2073,15 @@ fn host_room_join(app: &mut App) {
         match lightfox::room::lookup(&server, &code) {
             Ok((addr, port)) => {
                 // Format as a connectable address; IPv6 needs brackets, and the
-                // server returns the bare address, so re-bracket when it has a
-                // colon but no brackets already.
-                let shown = if addr.contains(':') && !addr.starts_with('[') {
-                    format!("[{addr}]:{port}")
+                // registry stores the bare address, so re-bracket when it has a
+                // colon but no brackets already. `addr` is a `RoomAddr`, so it
+                // is known to contain only hex/dot/colon/bracket characters —
+                // no newline can reach the status line below.
+                let a = addr.as_str();
+                let shown = if a.contains(':') && !a.starts_with('[') {
+                    format!("[{a}]:{port}")
                 } else {
-                    format!("{addr}:{port}")
+                    format!("{a}:{port}")
                 };
                 r.notes.push(format!("房号 {} → {shown}", code.as_str()));
                 r.notes.push("在游戏的“多人游戏 → 直接连接”里输入上面的地址。".to_string());
