@@ -34,7 +34,7 @@ pub const DEFAULT_PORT: u16 = 25565;
 /// Mapping lifetime to request, in seconds. 4 hours: long enough for an
 /// evening, short enough that a crashed launcher does not leave a permanent
 /// hole in the router.
-const LEASE_SECONDS: u32 = 4 * 3600;
+pub const LEASE_SECONDS: u32 = 4 * 3600;
 
 /// Why an attempt did not produce a working mapping. The UI shows the
 /// detail string verbatim; the enum is for logic ("is it worth retrying").

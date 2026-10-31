@@ -23,8 +23,10 @@
 
 pub mod assets;
 pub mod deps;
+pub mod firewall;
 pub mod hash;
 pub mod hostnet;
+pub mod hosting;
 pub mod inflate;
 pub mod java;
 pub mod javafind;
@@ -33,6 +35,7 @@ pub mod libraries;
 pub mod loaders;
 pub mod lock;
 pub mod modrinth;
+pub mod natpmp;
 pub mod net;
 pub mod notify;
 pub mod profiles;
