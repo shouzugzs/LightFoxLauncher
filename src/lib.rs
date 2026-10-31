@@ -24,6 +24,7 @@
 pub mod assets;
 pub mod deps;
 pub mod hash;
+pub mod hostnet;
 pub mod inflate;
 pub mod java;
 pub mod javafind;
@@ -40,6 +41,7 @@ pub mod util;
 pub mod version;
 pub mod versionmgr;
 pub mod zip;
+pub mod upnp;
 
 pub mod launcher;
 
