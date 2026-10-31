@@ -31,6 +31,12 @@ const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// Length of a room code.
 pub const CODE_LEN: usize = 6;
 
+/// Longest address accepted from the registry.
+///
+/// Well above the longest legitimate IPv6 literal (45 characters) but short
+/// enough that a hostile record cannot push a paragraph into a status line.
+const ADDR_MAX_CHARS: usize = 64;
+
 /// A validated room code. Construction goes through [`RoomCode::parse`] or
 /// [`RoomCode::generate`], so an instance is always well-formed — the registry
 /// relies on that when it builds a KV key.
@@ -51,7 +57,11 @@ impl RoomCode {
             ));
         }
         for c in up.chars() {
-            if !ALPHABET.contains(&(c as u8)) {
+            // Compare as `char`, never `c as u8`: that cast truncates, so
+            // `'Ł'` (U+0141) would become `b'A'` and a code that is not on the
+            // alphabet would be accepted — then stored and looked up as a
+            // different, valid-looking code.
+            if !c.is_ascii() || !ALPHABET.contains(&(c as u8)) {
                 // Name the offending character: a user who typed 0 instead of O
                 // needs to know which one is wrong, not just that something is.
                 let hint = match c {
@@ -142,6 +152,21 @@ fn parse_reply(body: &[u8], what: &str) -> Res<Json> {
     Ok(json)
 }
 
+/// Build the POST body for [`register`].
+///
+/// Hand-built rather than via a serialiser (the crate has no `serde`), so
+/// `addr` **must** go through [`crate::json::escape`]: it arrives from
+/// `hostnet` and can be an IPv6 literal with a zone id, and without escaping a
+/// `"` or `\` in it either breaks the document or, for
+/// `x","port":1,"z":"`, injects extra fields the registry would act on.
+fn register_body(code: &RoomCode, addr: &str, port: u16) -> String {
+    format!(
+        "{{\"code\":\"{}\",\"addr\":\"{}\",\"port\":{port}}}",
+        code.as_str(),
+        crate::json::escape(addr)
+    )
+}
+
 /// Register (or renew) a room: `code → addr:port` for ten minutes.
 ///
 /// Returns the lifetime in seconds as the server reported it. `addr` is the
@@ -155,11 +180,7 @@ pub fn register(server: &str, code: &RoomCode, addr: &str, port: u16) -> Res<u64
     if port == 0 {
         return Err("端口不能为 0".to_string());
     }
-    let body = format!(
-        "{{\"code\":\"{}\",\"addr\":\"{}\",\"port\":{port}}}",
-        code.as_str(),
-        addr.trim()
-    );
+    let body = register_body(code, addr.trim(), port);
     let url = format!("{base}/api/room");
     let (status, raw) = crate::net::post_json(&url, &body)?;
     let json = parse_reply(&raw, "注册房号")?;
@@ -174,6 +195,64 @@ pub fn register(server: &str, code: &RoomCode, addr: &str, port: u16) -> Res<u64
         "注册房号失败（HTTP {status}）：{}",
         explain(err)
     ))
+}
+
+/// Check an address the registry returned before it reaches a connect box.
+///
+/// The response is remote data, and the launcher both **shows** it (a status
+/// line the GUI formats with `\n` between lines) and offers it as the address
+/// to connect to. A newline in it therefore forges a whole extra status line —
+/// `"1.2.3.4\n[已上线] …"` renders as two lines, the second one not written by
+/// the launcher — and a value with a space or a quote ends up in a
+/// `host:port` string nobody can connect to.
+///
+/// The registry's own validation (`site/functions/api/room.js`) is an
+/// allowlist of `[0-9A-Fa-f:.[]]`, but this client must not depend on a
+/// deployment behaving: the check is repeated here, and it is the same
+/// allowlist, so nothing legitimate is lost.
+fn checked_addr(addr: &str) -> Res<String> {
+    if addr.is_empty() {
+        return Err("查询房号：响应中的地址为空".to_string());
+    }
+    if addr.len() > ADDR_MAX_CHARS {
+        return Err(format!(
+            "查询房号：响应中的地址过长（{} 个字符）",
+            addr.len()
+        ));
+    }
+    if let Some(c) = addr
+        .chars()
+        .find(|c| !matches!(c, '0'..='9' | 'A'..='F' | 'a'..='f' | ':' | '.' | '[' | ']'))
+    {
+        return Err(format!("查询房号：响应中的地址包含非法字符 {c:?}"));
+    }
+    Ok(addr.to_string())
+}
+
+/// Turn a registry lookup response into `(addr, port)`.
+///
+/// Split out of [`lookup`] so the whole response path — `ok` handling, the
+/// error enum, the port range and the address allowlist — is testable without
+/// a network, the same way `notify::parse` is.
+fn parse_lookup(body: &[u8]) -> Res<(String, u16)> {
+    let json = parse_reply(body, "查询房号")?;
+    let ok = json.str_at("ok") == Some("true")
+        || json.path(&["ok"]).and_then(|v| v.as_bool()) == Some(true);
+    if !ok {
+        let err = json.str_at("error").unwrap_or("server_error");
+        return Err(explain(err));
+    }
+    let addr = json
+        .str_at("addr")
+        .ok_or_else(|| "查询房号：响应缺少地址".to_string())?;
+    let port = json
+        .path(&["port"])
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "查询房号：响应缺少端口".to_string())?;
+    if !(1..=65535).contains(&port) {
+        return Err("查询房号：响应中的端口无效".to_string());
+    }
+    Ok((checked_addr(addr)?, port as u16))
 }
 
 /// Look a room up and return the host's `(addr, port)`.
@@ -194,25 +273,7 @@ pub fn lookup(server: &str, code: &RoomCode) -> Res<(String, u16)> {
             return Err(format!("查询房号失败：{e}"));
         }
     };
-    let json = parse_reply(&raw, "查询房号")?;
-    let ok = json.str_at("ok") == Some("true")
-        || json.path(&["ok"]).and_then(|v| v.as_bool()) == Some(true);
-    if !ok {
-        let err = json.str_at("error").unwrap_or("server_error");
-        return Err(explain(err));
-    }
-    let addr = json
-        .str_at("addr")
-        .ok_or_else(|| "查询房号：响应缺少地址".to_string())?
-        .to_string();
-    let port = json
-        .path(&["port"])
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| "查询房号：响应缺少端口".to_string())?;
-    if !(1..=65535).contains(&port) {
-        return Err("查询房号：响应中的端口无效".to_string());
-    }
-    Ok((addr, port as u16))
+    parse_lookup(&raw)
 }
 
 #[cfg(test)]
@@ -259,6 +320,44 @@ mod tests {
     fn parse_error_names_the_offending_character() {
         let e = RoomCode::parse("AB0234").unwrap_err();
         assert!(e.contains('0'), "error should name the character: {e}");
+    }
+
+    #[test]
+    fn parse_rejects_non_ascii_that_truncates_onto_the_alphabet() {
+        // `c as u8` truncates: 'Ł' is U+0141, whose low byte is 0x41 = 'A'.
+        // With a byte cast in the membership test this input was accepted and
+        // silently became a *different* valid code ("ABC234") — the user would
+        // then register a room nobody else could reach. Every non-ASCII
+        // character must be rejected, not folded onto the alphabet.
+        for bad in ["ŁBC234", "ABC23Ł", "ＡBC234", "ABC234\u{00AD}"] {
+            assert!(
+                RoomCode::parse(bad).is_err(),
+                "{bad:?} must be rejected, got {:?}",
+                RoomCode::parse(bad)
+            );
+        }
+        // The legitimate ASCII neighbours still work, so the check is not
+        // simply rejecting everything.
+        assert_eq!(RoomCode::parse("abc234").unwrap().as_str(), "ABC234");
+    }
+
+    #[test]
+    fn register_body_is_valid_json_for_any_address() {
+        // The body is built by hand, so an address containing a quote or a
+        // backslash used to produce invalid JSON — or, for
+        // `x","port":1,"z":"`, a *valid* document with extra fields. Escaping
+        // must neutralise both, and the address must round-trip unchanged.
+        let code = RoomCode::parse("ABC234").unwrap();
+        for addr in ["1.2.3.4", "::1", "fe80::1%eth0", "a\"b", "c\\d", "x\",\"port\":1,\"z\":\""] {
+            let body = register_body(&code, addr, 25565);
+            let parsed = Json::parse(&body)
+                .unwrap_or_else(|e| panic!("body for {addr:?} is not JSON: {e} ({body})"));
+            assert_eq!(parsed.str_at("addr"), Some(addr), "addr round trip: {body}");
+            assert_eq!(parsed.str_at("code"), Some("ABC234"));
+            assert_eq!(parsed.u64_at("port"), Some(25565), "port must not be overwritten");
+            // No injected key may survive.
+            assert!(parsed.get("z").is_none(), "injected field in {body}");
+        }
     }
 
     #[test]
@@ -337,10 +436,78 @@ mod tests {
     }
 
     #[test]
+    fn lookup_response_is_parsed_through_the_address_check() {
+        // The real response path, so removing the `checked_addr` call from
+        // `lookup` fails here rather than silently shipping.
+        let good = parse_lookup(br#"{"ok":true,"addr":"2001:db8::1","port":25565}"#).unwrap();
+        assert_eq!(good, ("2001:db8::1".to_string(), 25565));
+
+        // A hostile record reaches the same path a real one does. The newline
+        // must arrive as a JSON **escape**: `json.rs` rejects a raw control
+        // character, and `JSON.stringify` on the server side emits `\n` too,
+        // so this is the shape the attack actually takes.
+        let hostile = "{\"ok\":true,\"addr\":\"1.2.3.4\\n[已上线] x\",\"port\":25565}";
+        let err = parse_lookup(hostile.as_bytes()).unwrap_err();
+        assert!(err.contains("非法字符"), "{err}");
+
+        // The registry's closed error enum maps to actionable text.
+        for (body, needle) in [
+            (r#"{"ok":false,"error":"not_found"}"#, "过期"),
+            (r#"{"ok":false,"error":"rate_limited"}"#, "频繁"),
+            (r#"{"ok":false,"error":"server_error"}"#, "不可用"),
+            (r#"{"ok":false}"#, "不可用"),
+        ] {
+            let err = parse_lookup(body.as_bytes()).unwrap_err();
+            assert!(err.contains(needle), "{body} -> {err}");
+        }
+
+        // A missing or out-of-range port is refused, not truncated to u16.
+        for body in [
+            r#"{"ok":true,"addr":"1.2.3.4"}"#,
+            r#"{"ok":true,"addr":"1.2.3.4","port":0}"#,
+            r#"{"ok":true,"addr":"1.2.3.4","port":70000}"#,
+            r#"{"ok":true,"addr":"1.2.3.4","port":"25565"}"#,
+        ] {
+            assert!(parse_lookup(body.as_bytes()).is_err(), "{body}");
+        }
+    }
+
+    #[test]
     fn reply_parsing_rejects_non_json() {
         assert!(parse_reply(b"not json", "test").is_err());
         assert!(parse_reply(b"[]", "test").is_err());
         assert!(parse_reply(b"{\"ok\":true}", "test").is_ok());
+    }
+
+    #[test]
+    fn a_hostile_address_cannot_forge_a_status_line() {
+        // The GUI formats the join result as `房号 X → {shown}` and splits the
+        // report into lines, so a newline in the address from the registry adds
+        // a status line the launcher never wrote. Reproduced shape:
+        // `"1.2.3.4\n[已上线] …"` renders as two lines.
+        for bad in [
+            "1.2.3.4\n[已上线] 你被入侵了",
+            "1.2.3.4\r\nx",
+            "1.2.3.4 5.6.7.8",
+            "1.2.3.4\"",
+            "",
+            "::1%eth0",              // IPv6 zone id: percent is not allowed
+            &"1".repeat(ADDR_MAX_CHARS + 1),
+        ] {
+            assert!(checked_addr(bad).is_err(), "{bad:?} must be refused");
+        }
+        // Everything the registry can legitimately return must survive
+        // unchanged, including the IPv6 forms the join path re-brackets.
+        for good in [
+            "1.2.3.4",
+            "::1",
+            "fe80::1",
+            "2001:db8::8a2e:370:7334",
+            "[::1]",
+            "192.168.1.10",
+        ] {
+            assert_eq!(checked_addr(good).unwrap(), good, "{good:?} must be kept");
+        }
     }
 
     /// Live round trip. Requires the registry to be deployed, hence `ignore`.
