@@ -786,6 +786,41 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_feed_json_parses() {
+        // `site/feed.json` is the announcement document the docs tell users to
+        // paste into the 通知 page. It is edited by hand next to this parser,
+        // so nothing structural stops it from drifting out of shape — a typo in
+        // `level`, a version string `is_version_shaped` rejects, an over-long
+        // field silently dropped at display time. Parsing the shipped file with
+        // the real parser in CI closes that gap: if this test fails, the site
+        // and the launcher disagree, and the fix belongs in the site.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("site/feed.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e} (run from the repo root)", path.display()));
+        let feed = parse(&text).expect("shipped feed must parse");
+        // Whatever the file says, every note must carry a non-empty identity:
+        // an empty id/date/title triple makes the read-state meaningless.
+        for n in &feed.notes {
+            assert!(!n.id.is_empty(), "note id must not be empty");
+            assert!(!n.title.is_empty(), "note title must not be empty");
+            assert!(n.body.chars().count() <= MAX_FIELD, "note body too long");
+        }
+        if let Some(v) = &feed.latest {
+            assert!(
+                is_version_shaped(v),
+                "shipped latest={v:?} is not version-shaped; the update hint would never show"
+            );
+        }
+        if let Some(u) = &feed.url {
+            let lower = u.to_ascii_lowercase();
+            assert!(
+                lower.starts_with("https://") || lower.starts_with("http://"),
+                "shipped feed url must be http(s)"
+            );
+        }
+    }
+
+    #[test]
     fn invisible_format_characters_cannot_spoof_a_title() {
         // `char::is_control` is category Cc only, so a bidi override or a
         // zero-width joiner used to survive into the list box and the state

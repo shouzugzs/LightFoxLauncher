@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LightFoxLauncher — 零依赖 Rust Minecraft 启动器</title>
+  <meta name="description" content="LightFoxLauncher 是一个零依赖的原生 Win32 Minecraft 启动器：纯 Rust 手写 JSON/ZIP/DEFLATE/SHA-1/HTTP，单文件小于 1 MB，离线单机，无登录无认证，无遥测，MPL-2.0 开源。">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="container">
+      <h1>LightFoxLauncher</h1>
+      <p class="tagline">零依赖 · 原生 Win32 · 单文件 &lt;1 MB</p>
+      <p class="sub">用纯 Rust 手写的 Minecraft 启动器：不引第三方库，不登录，不上报，一个 exe 放进文件夹就能用。</p>
+      <p class="cta">
+        <a class="btn" href="https://github.com/shouzugzs/LightFoxLauncher/releases">前往 Releases 下载</a>
+        <a class="btn btn-ghost" href="#notify">配置通知</a>
+      </p>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="features" aria-labelledby="features-h">
+      <h2 id="features-h">特性</h2>
+      <div class="cards">
+        <article class="card">
+          <h3>零第三方依赖</h3>
+          <p>JSON、ZIP、DEFLATE、SHA-1、HTTP 全部纯 Rust 手写实现，不引入任何第三方 crate。代码量小，可审计性强。</p>
+        </article>
+        <article class="card">
+          <h3>原生 Win32 GUI</h3>
+          <p>直接调用 Win32 API 绘制界面，不打包浏览器内核，不依赖运行时，内存占用极低，启动瞬间完成。</p>
+        </article>
+        <article class="card">
+          <h3>离线单机</h3>
+          <p>无登录、无认证、无账号体系。只为离线单机设计，填个用户名就能进世界。</p>
+        </article>
+        <article class="card">
+          <h3>MPL-2.0 开源</h3>
+          <p>源代码完全公开，基于 MPL-2.0 许可证发布，欢迎阅读、修改与反馈。</p>
+        </article>
+        <article class="card">
+          <h3>无遥测、无内置服务器</h3>
+          <p>不上传任何数据，不内嵌任何服务端组件。通知接收默认关闭，是否启用由你决定。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="download" aria-labelledby="download-h">
+      <h2 id="download-h">下载</h2>
+      <p>当前版本：<strong>0.3.2</strong>。所有版本请见 <a href="https://github.com/shouzugzs/LightFoxLauncher/releases">GitHub Releases 页</a>。</p>
+      <table>
+        <thead>
+          <tr><th>文件</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>LFL.exe</code></td><td>命令行版本，脚本与自动化友好</td></tr>
+          <tr><td><code>LFL-gui.exe</code></td><td>图形界面版本，原生 Win32 窗口</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="notify" aria-labelledby="notify-h">
+      <h2 id="notify-h">通知服务器使用说明</h2>
+      <p>LightFoxLauncher 支持接收公告与新版本提示：在启动器的「通知」页地址框中填入一个 URL，启动器会定时 GET 该地址并展示公告内容。</p>
+      <p>把下面这个地址粘贴进去即可：</p>
+      <p><code class="feed-url">https://lightfox.pages.dev/feed.json</code></p>
+      <ul>
+        <li>该地址由本站托管，站点更新即公告更新，无需重新下载启动器。</li>
+        <li>启动器默认<strong>不启用</strong>通知功能，首次启动时会询问你是否开启——不开就完全不会发起请求。</li>
+        <li>通知内容只用于展示，启动器不会自动执行其中的任何链接。</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-inner">
+      <p>
+        <a href="https://github.com/shouzugzs/LightFoxLauncher/blob/main/LICENSE">MPL-2.0 许可证</a> ·
+        <a href="https://github.com/shouzugzs/LightFoxLauncher">GitHub</a>
+      </p>
+      <p class="muted">无 cookie、无统计、无跟踪</p>
+    </div>
+    <!-- 蜜罐链接：仅供爬虫机器人跟进，普通用户不可见、不可聚焦 -->
+    <a href="/admin" style="display:none" aria-hidden="true" tabindex="-1">admin</a>
+    <a href="/panel" style="display:none" aria-hidden="true" tabindex="-1">panel</a>
+    <a href="/wp-admin" style="display:none" aria-hidden="true" tabindex="-1">wp-admin</a>
+  </footer>
+</body>
+</html>

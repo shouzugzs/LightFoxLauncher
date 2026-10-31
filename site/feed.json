@@ -1,0 +1,13 @@
+{
+  "latest": "0.3.2",
+  "url": "https://github.com/shouzugzs/LightFoxLauncher/releases",
+  "notes": [
+    {
+      "id": "2025-10-31-032",
+      "date": "2025-10-31",
+      "title": "0.3.2 发布",
+      "body": "安全加固第三轮：通知与更新检查链路修复。\n\n- 首次启动会询问是否启用通知接收\n- 下载与解析层多处加固\n\n下载请见发布页。",
+      "level": "update"
+    }
+  ]
+}
