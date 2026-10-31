@@ -7,7 +7,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const src = readFileSync(new URL("../site/functions/api/login.js", import.meta.url), "utf8");
+const src = readFileSync(
+  new URL("../private-site/functions/api/login.js", import.meta.url),
+  "utf8",
+);
 const dir = mkdtempSync(join(tmpdir(), "hp-test-"));
 const modPath = join(dir, "login.mjs");
 // Strip the SPDX comment block? Not needed — it is comments only.
