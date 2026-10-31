@@ -40,6 +40,7 @@ pub mod net;
 pub mod notify;
 pub mod profiles;
 pub mod settings;
+pub mod servermod;
 pub mod util;
 pub mod version;
 pub mod versionmgr;

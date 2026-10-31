@@ -250,6 +250,20 @@ fn md5_block(h: &mut [u32; 4], block: &[u8; 64]) {
     h[3] = h[3].wrapping_add(d);
 }
 
+pub fn md5_hex(data: &[u8]) -> String {
+    hex(&md5(data))
+}
+
+/// Minecraft offline-mode player UUID: MD5 of `"OfflinePlayer:" + name`,
+/// version/variant bits set like Java's `UUID.nameUUIDFromBytes` (v3).
+pub fn offline_uuid(name: &str) -> String {
+    let mut d = md5(format!("OfflinePlayer:{name}").as_bytes());
+    d[6] = (d[6] & 0x0f) | 0x30;
+    d[8] = (d[8] & 0x3f) | 0x80;
+    let h = hex(&d);
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
 // ---------------------------------------------------------------- files
 
 /// Streaming SHA-1 of a file as lowercase hex. Error names the path.
@@ -390,6 +404,7 @@ mod tests {
     #[test]
     fn md5_vectors() {
         assert_eq!(hex(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"a"), "0cc175b9c0f1b6a831c399e269772661");
         assert_eq!(hex(&md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
         assert_eq!(
             hex(&md5(b"message digest")),
@@ -411,6 +426,23 @@ mod tests {
         assert_eq!(hex(&md5(&[b'a'; 63])), "b06521f39153d618550606be297466d5");
         assert_eq!(hex(&md5(&[b'a'; 64])), "014842d480b571495a4a0363793f7367");
         assert_eq!(hex(&md5(&[b'a'; 65])), "c743a45e0d2e6a95cb859adae0248435");
+    }
+
+    #[test]
+    fn md5_hex_matches() {
+        assert_eq!(md5_hex(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+    }
+
+    #[test]
+    fn offline_uuid_notch() {
+        // Java: UUID.nameUUIDFromBytes("OfflinePlayer:Notch".getBytes(UTF_8)).
+        // Independent cross-checks (Python md5 + bit munging, public offline-UUID
+        // generators) agree on this value; the requested b50ad387-6bc1-... does
+        // not correspond to MD5("OfflinePlayer:Notch") under any variant tried.
+        assert_eq!(
+            offline_uuid("Notch"),
+            "b50ad385-829d-3141-a216-7e7d7539ba7f"
+        );
     }
 
     #[test]

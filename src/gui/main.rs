@@ -140,6 +140,16 @@ const ID_NOTIFY_STATUS: i32 = 705;
 const ID_NOTIFY_MARK_ALL: i32 = 706;
 const ID_NOTIFY_AUTO: i32 = 707;
 const ID_NOTIFY_OPEN: i32 = 708;
+// 联机 (play together / hosting) page
+const ID_HOST_DETECT: i32 = 751;
+const ID_HOST_OPEN: i32 = 752;
+const ID_HOST_CLOSE: i32 = 753;
+const ID_HOST_COPY: i32 = 754;
+const ID_HOST_ADDR: i32 = 755;
+const ID_HOST_PORT: i32 = 756;
+const ID_HOST_STATUS: i32 = 757;
+const ID_HOST_INFO: i32 = 758;
+const ID_HOST_JOIN: i32 = 759;
 
 const TIMER_UI: usize = 1;
 const WM_APP_LOG: UINT = WM_APP + 1;
@@ -150,6 +160,7 @@ const WM_APP_SEARCH: UINT = WM_APP + 5;
 const WM_APP_MANIFEST: UINT = WM_APP + 6;
 const WM_APP_LOADER: UINT = WM_APP + 7;
 const WM_APP_NOTIFY: UINT = WM_APP + 8;
+const WM_APP_HOST: UINT = WM_APP + 9;
 
 /// Logical layout metrics (96 dpi).
 const WIN_W: i32 = 780;
@@ -297,6 +308,23 @@ struct App {
     feed: Option<lightfox::notify::Feed>,
     /// Which notes have been read, plus the update already reported.
     seen: lightfox::notify::Seen,
+    /// 联机 page controls.
+    host_ctl: Vec<HWND>,
+    host_detect: HWND,
+    host_open: HWND,
+    host_close: HWND,
+    host_copy: HWND,
+    host_addr: HWND,
+    host_port: HWND,
+    host_status: HWND,
+    host_info: HWND,
+    /// Set while a hosting attempt runs; cleared by the worker's completion
+    /// message. Same pattern as `feed_busy`.
+    host_busy: std::sync::atomic::AtomicBool,
+    /// Port the in-flight attempt is for (cleanup must target the same port).
+    host_port_busy: std::sync::atomic::AtomicU32,
+    /// Result channel for the hosting worker (same pattern as `feed_q`).
+    host_q: Arc<Mutex<Option<lightfox::hosting::HostReport>>>,
     /// Set while a feed fetch runs, so a second click cannot stack requests.
     feed_busy: std::sync::atomic::AtomicBool,
     /// When the in-flight fetch started, so a lost worker cannot wedge the
@@ -449,6 +477,18 @@ impl App {
             notify_open: std::ptr::null_mut(),
             feed: None,
             seen: lightfox::notify::Seen::default(),
+            host_ctl: Vec::new(),
+            host_detect: std::ptr::null_mut(),
+            host_open: std::ptr::null_mut(),
+            host_close: std::ptr::null_mut(),
+            host_copy: std::ptr::null_mut(),
+            host_addr: std::ptr::null_mut(),
+            host_port: std::ptr::null_mut(),
+            host_status: std::ptr::null_mut(),
+            host_info: std::ptr::null_mut(),
+            host_busy: std::sync::atomic::AtomicBool::new(false),
+            host_port_busy: std::sync::atomic::AtomicU32::new(0),
+            host_q: Arc::new(Mutex::new(None)),
             feed_busy: std::sync::atomic::AtomicBool::new(false),
             feed_started: None,
             feed_q: Arc::new(Mutex::new(None)),
@@ -798,6 +838,10 @@ unsafe extern "system" fn wnd_proc(
                 ID_NOTIFY_MARK_ALL if code == BN_CLICKED => notify_mark_all(app),
                 ID_NOTIFY_OPEN if code == BN_CLICKED => show_tab(app, 1),
                 ID_NOTIFY_AUTO if code == BN_CLICKED => notify_save_auto(app),
+                ID_HOST_DETECT if code == BN_CLICKED => host_detect_now(app),
+                ID_HOST_OPEN if code == BN_CLICKED => host_open_now(app),
+                ID_HOST_CLOSE if code == BN_CLICKED => host_close_now(app),
+                ID_HOST_COPY if code == BN_CLICKED => host_copy_addr(app),
                 ID_NOTIFY_LIST if code == LBN_SELCHANGE => notify_selection_changed(app),
                 ID_SRCH_BTN if code == BN_CLICKED => search_run(app),
                 ID_SRCH_DL if code == BN_CLICKED => search_download(app),
@@ -866,6 +910,12 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_NOTIFY => {
             if !app_ptr.is_null() {
                 notify_done(&mut *app_ptr);
+            }
+            0
+        }
+        WM_APP_HOST => {
+            if !app_ptr.is_null() {
+                host_done(&mut *app_ptr);
             }
             0
         }
@@ -1089,6 +1139,7 @@ fn show_tab(app: &mut App, tab: usize) {
             &app.set_ctl,
             &app.tool_ctl,
             &app.notify_ctl,
+            &app.host_ctl,
         ];
         for (i, group) in groups.iter().enumerate() {
             for &h in group.iter() {
@@ -1153,6 +1204,28 @@ fn show_tab(app: &mut App, tab: usize) {
         ] {
             if !h.is_null() {
                 ShowWindow(h, if tab == 6 { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        // 联机 page: buttons (the edits/panels are in host_ctl above).
+        for h in [app.host_detect, app.host_open, app.host_close, app.host_copy] {
+            if !h.is_null() {
+                ShowWindow(h, if tab == 7 { SW_SHOW } else { SW_HIDE });
+            }
+        }
+    }
+    // Entering the 联机 page seeds the info panel once, so the page never
+    // looks broken before the first 检测.
+    if tab == 7 {
+        unsafe {
+            let cur = window_text(app.host_info);
+            if cur.trim().is_empty() {
+                let seed = "1. 点“检测网络”查看本机联机条件（IPv6 地址 / IPv4 网关 / 防火墙）。\r\n\
+                            2. 点“开服（映射端口）”配置防火墙并尝试 UPnP/NAT-PMP 映射。\r\n\
+                            3. 把“复制地址”得到的地址发给朋友，朋友在多人游戏里直连。\r\n\r\n\
+                            说明：本启动器为离线模式，开放联机请务必配合白名单使用；\r\n\
+                            IPv6 直连需要双方都有 IPv6；运营商大内网（CGNAT）下 IPv4 映射不可用。";
+                let w = wide(seed);
+                SetWindowTextW(app.host_info, w.as_ptr());
             }
         }
     }
@@ -1688,7 +1761,220 @@ fn build_notify_page(app: &mut App) {
     }
 }
 
+/// 联机 page: connectivity detection, host mode (firewall + port mapping +
+/// copyable address), join mode (paste an address a host sent).
+fn build_host_page(app: &mut App) {
+    unsafe {
+        app.host_detect = child(app.hwnd, "BUTTON", "检测网络", WS_TABSTOP, ID_HOST_DETECT, 0);
+        app.host_open = child(app.hwnd, "BUTTON", "开服（映射端口）", WS_TABSTOP, ID_HOST_OPEN, 0);
+        app.host_close = child(app.hwnd, "BUTTON", "关闭映射", WS_TABSTOP, ID_HOST_CLOSE, 0);
+        app.host_port = child(
+            app.hwnd,
+            "EDIT",
+            "25565",
+            WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+            ID_HOST_PORT,
+            WS_EX_CLIENTEDGE,
+        );
+        app.host_copy = child(app.hwnd, "BUTTON", "复制地址", WS_TABSTOP, ID_HOST_COPY, 0);
+        app.host_addr = child(
+            app.hwnd,
+            "EDIT",
+            "",
+            ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+            ID_HOST_ADDR,
+            WS_EX_CLIENTEDGE,
+        );
+        app.host_status = child(app.hwnd, "STATIC", "", DT_LEFT, ID_HOST_STATUS, 0);
+        app.host_info = child(
+            app.hwnd,
+            "EDIT",
+            "",
+            ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+            ID_HOST_INFO,
+            WS_EX_CLIENTEDGE,
+        );
+        app.host_ctl = vec![
+            app.host_detect,
+            app.host_open,
+            app.host_close,
+            app.host_port,
+            app.host_copy,
+            app.host_addr,
+            app.host_status,
+            app.host_info,
+        ];
+        for h in &app.host_ctl {
+            SendMessageW(*h, WM_SETFONT, app.font_ui as WPARAM, 1);
+        }
+    }
+}
+
+/// Run `f` on a worker thread and post `WM_APP_HOST` when done, carrying the
+/// report through `host_q` — the same worker/result pattern the feed page uses.
+fn host_spawn<F>(app: &mut App, port: u16, f: F)
+where
+    F: FnOnce(u16) -> lightfox::hosting::HostReport + Send + 'static,
+{
+    if app.host_busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // one attempt at a time
+    }
+    app.host_port_busy.store(port as u32, std::sync::atomic::Ordering::SeqCst);
+    set_host_status(app, "正在处理…（UPnP/防火墙最多需要约 30 秒）");
+    enable_host_buttons(app, false);
+    let q = app.host_q.clone();
+    let hwnd_val = app.hwnd as usize;
+    std::thread::spawn(move || {
+        let res = f(port);
+        if let Ok(mut g) = q.lock() {
+            *g = Some(res);
+        }
+        unsafe {
+            PostMessageW(hwnd_val as HWND, WM_APP_HOST, 0, 0);
+        }
+    });
+}
+
+/// UI-thread half: take the worker's report and render it.
+fn host_done(app: &mut App) {
+    app.host_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+    app.host_port_busy.store(0, std::sync::atomic::Ordering::SeqCst);
+    enable_host_buttons(app, true);
+    let res = match app.host_q.lock() {
+        Ok(mut g) => g.take(),
+        Err(p) => p.into_inner().take(),
+    };
+    let Some(report) = res else { return };
+    let port = host_port_of(app);
+    let mut lines: Vec<String> = Vec::new();
+    if !report.v6_addresses.is_empty() {
+        lines.push("── IPv6 直连（优先推荐）──".to_string());
+        for a in &report.v6_addresses {
+            lines.push(format!("[{a}]:{port}"));
+        }
+    }
+    if let Some(m) = &report.v4_mapping {
+        lines.push("── IPv4 端口映射成功 ──".to_string());
+        lines.push(format!("{}:{}（经由 {}）", m.ip, m.port, m.via));
+    }
+    lines.push(format!(
+        "防火墙规则：{}",
+        if report.firewall_ok { "已放行" } else { "未放行（见下方说明）" }
+    ));
+    for n in &report.notes {
+        lines.push(String::new());
+        lines.push(format!("· {n}"));
+    }
+    // The shareable address block: whatever friends can actually use.
+    let mut share = String::new();
+    if !report.v6_addresses.is_empty() {
+        share.push_str(&format!("[{}]:{}\r\n", report.v6_addresses[0], port));
+    }
+    if let Some(m) = &report.v4_mapping {
+        share.push_str(&format!("{}:{}\r\n", m.ip, m.port));
+    }
+    if share.is_empty() {
+        share.push_str("（暂无可分享的直连地址，请阅读下方说明）\r\n");
+    }
+    unsafe {
+        let w = wide(&share);
+        SetWindowTextW(app.host_addr, w.as_ptr());
+        let info = lines.join("\r\n");
+        let w = wide(&info);
+        SetWindowTextW(app.host_info, w.as_ptr());
+    }
+    set_host_status(app, "完成。");
+}
+
+fn host_port_of(app: &App) -> u16 {
+    window_text(app.host_port).trim().parse().unwrap_or(25565)
+}
+
+fn set_host_status(app: &App, text: &str) {
+    unsafe {
+        let w = wide(text);
+        SetWindowTextW(app.host_status, w.as_ptr());
+    }
+}
+
+fn enable_host_buttons(app: &App, on: bool) {
+    unsafe {
+        for h in [app.host_detect, app.host_open, app.host_close, app.host_copy] {
+            if !h.is_null() {
+                EnableWindow(h, on as i32);
+            }
+        }
+    }
+}
+
+/// "检测网络": detection only, no mapping, no firewall change.
+fn host_detect_now(app: &mut App) {
+    host_spawn(app, host_port_of(app), |port| {
+        let net = lightfox::hostnet::detect();
+        let mut r = lightfox::hosting::HostReport {
+            v6_addresses: net.v6_global.clone(),
+            ..Default::default()
+        };
+        r.firewall_ok = lightfox::firewall::rule_exists();
+        if net.v6_global.is_empty() {
+            r.notes.push("未检测到全球 IPv6 地址。若宽带支持 IPv6，检查路由器是否开启 IPv6 前缀分发。".to_string());
+        }
+        if net.v4_gateways.is_empty() {
+            r.notes.push("未找到 IPv4 默认网关；无法尝试 UPnP/NAT-PMP。".to_string());
+        } else {
+            r.notes.push(format!("IPv4 网关：{}（端口映射尝试的目标）", net.v4_gateways[0]));
+        }
+        r.notes.push(format!(
+            "检测完成（目标端口 {port}）。点“开服（映射端口）”开始联机配置。"
+        ));
+        r
+    });
+}
+
+/// "开服": the full hosting attempt (firewall + UPnP + NAT-PMP fallback).
+fn host_open_now(app: &mut App) {
+    let port = host_port_of(app);
+    if port == 0 {
+        set_host_status(app, "端口无效：不能为 0。");
+        return;
+    }
+    host_spawn(app, port, |port| {
+        lightfox::hosting::attempt(port).unwrap_or_else(|e| {
+            let mut r = lightfox::hosting::HostReport::default();
+            r.notes.push(format!("开服尝试失败：{e}"));
+            r
+        })
+    });
+}
+
+/// "关闭映射": best-effort teardown of the port mapping (firewall rule stays).
+fn host_close_now(app: &mut App) {
+    let port = host_port_of(app);
+    host_spawn(app, port, |port| {
+        let mut r = lightfox::hosting::HostReport::default();
+        match lightfox::hosting::cleanup(port) {
+            Ok(()) => r.notes.push(format!("已请求删除端口 {port} 的映射。部分路由器的映射表刷新有延迟。")),
+            Err(e) => r.notes.push(format!("删除映射失败：{e}")),
+        }
+        r
+    });
+}
+
+/// "复制地址": put the shareable block on the clipboard.
+fn host_copy_addr(app: &App) {
+    let text = window_text(app.host_addr);
+    if text.trim().is_empty() {
+        set_host_status(app, "还没有可复制的地址，先点“检测网络”或“开服”。");
+        return;
+    }
+    match set_clipboard(&text) {
+        Ok(()) => set_host_status(app, "地址已复制到剪贴板。"),
+        Err(e) => set_host_status(app, &format!("复制失败：{e}")),
+    }
+}
+
 fn build_controls(app: &mut App) {
+    build_host_page(app);
     app.font_ui = make_font(-15, FW_NORMAL);
     app.font_bold = make_font(-15, FW_BOLD);
     // Published for the section headings, which are drawn on every repaint.
@@ -1863,7 +2149,7 @@ fn refresh_worker_note(app: &App) {
 const TAB_H: i32 = 34;
 /// Number of pages. Must match the label list in `paint` and the `show_tab`
 /// control groups, or a page becomes unreachable.
-const TABS: usize = 7;
+const TABS: usize = 8;
 const CHROME_TOP: i32 = 64;
 
 /// Layout metrics — the **single source of truth** for `layout()` and `paint()`.
@@ -2154,6 +2440,26 @@ fn layout(app: &App) {
                 let half = (cw_in - GAP) / 2;
                 MoveWindow(app.notify_list, cx, lt, half, lh, 1);
                 MoveWindow(app.notify_body, cx + half + GAP, lt, half, lh, 1);
+            }
+            7 => {
+                // 联机: one card (detect / open / port / close / copy / status),
+                // then the shareable address on the left and the explanation
+                // panel on the right — mirroring the 通知 page's two-column
+                // tail so the pages read as siblings.
+                let b = content_y(top, true);
+                MoveWindow(app.host_detect, cx, b, 100, ROW_H, 1);
+                MoveWindow(app.host_open, cx + 108, b, 130, ROW_H, 1);
+                MoveWindow(app.host_close, cx + 246, b, 100, ROW_H, 1);
+                MoveWindow(app.host_port, cx + 354, b, 80, ROW_H, 1);
+                MoveWindow(app.host_copy, cx + 442, b, 100, ROW_H, 1);
+                MoveWindow(app.host_status, cx + 550, b + 3, cw_in - 550, 22, 1);
+                let card_bottom = card_end(top, 2, true);
+
+                let lt = card_bottom + CARD_PAD;
+                let lh = (ch - lt - CARD_PAD - PAD).max(80);
+                let half = (cw_in - GAP) / 2;
+                MoveWindow(app.host_addr, cx, lt, half, lh, 1);
+                MoveWindow(app.host_info, cx + half + GAP, lt, half, lh, 1);
             }
             // `show_tab` clamps to TABS-1, so this is unreachable in practice;
             // it exists so adding a page without a layout branch is a compile
@@ -2565,7 +2871,7 @@ fn paint(app: &App) {
 
         // ---- tab bar -------------------------------------------------------
         SelectObject(hdc, app.font_ui as HGDIOBJ);
-        for (i, label) in ["启动", "下载", "模组", "版本", "设置", "工具", "通知"].iter().enumerate() {
+        for (i, label) in ["启动", "下载", "模组", "版本", "设置", "工具", "通知", "联机"].iter().enumerate() {
             let tw = tab_width(i);
             let left = PAD + tab_left(i);
             let active = app.tab == i;
