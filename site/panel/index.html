@@ -5,16 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LightFox 管理面板</title>
   <meta name="robots" content="noindex">
-  <!--
-    ============================================================
-    蜜罐声明（Honeypot Notice）
-    本页面是针对恶意爬虫/漏洞扫描器的静态蜜罐，不是真实的管理面板。
-    无后端、无数据库、无存储、无日志：登录表单提交到 /api/login，
-    该地址在 Cloudflare Pages 静态站点上不存在，POST 请求只会得到
-    405 Method Not Allowed，不返回任何有用信息。
-    本站不接收、不保存、不处理任何提交的数据。
-    ============================================================
-  -->
 </head>
 <body style="margin:0; background:#1c1e22; color:#d7dce2; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif; min-height:100vh; display:flex; align-items:center; justify-content:center;">
 
@@ -23,6 +13,7 @@
     <p style="text-align:center; color:#8b929c; font-size:0.85rem; margin:0 0 24px;">请登录以继续</p>
 
     <form action="/api/login" method="post">
+      <input type="hidden" name="source" value="panel">
       <label for="username" style="display:block; font-size:0.85rem; margin-bottom:6px; color:#8b929c;">用户名</label>
       <input type="text" id="username" name="username" autocomplete="username"
         style="width:100%; box-sizing:border-box; padding:10px 12px; margin-bottom:16px; background:#191b1f; border:1px solid #32363d; border-radius:6px; color:#d7dce2; font-size:0.95rem;">

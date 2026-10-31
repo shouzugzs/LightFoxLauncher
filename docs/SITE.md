@@ -63,17 +63,55 @@ Pages 自动构建并发布。每一次变更都在 git 历史里，可审计、
 
 ## 蜜罐
 
-`site/admin/`、`site/panel`、`site/wp-admin` 路径是一组**假管理后台**：
+`site/admin/`、`site/panel/`、`site/wp-admin/` 是一组**假管理后台**，带防御性
+捕获能力：
 
-* 页面长得像登录框，表单提交到不存在的 `/api/login`；
-* Cloudflare Pages 对静态站点的 POST 一律返回 `405 Method Not Allowed` —
-  这就是"捕获"：请求被拒绝，不存储任何东西，不产生任何反馈；
-* 站点没有任何后端、数据库、日志服务，蜜罐本身**无数据可泄露**；
-* `robots.txt` 列出这些路径 — 这是有意的：爬虫与漏洞扫描器会顺着进来撞上
-  405，真人几乎不会。
+* 页面像登录框，表单提交到 `/api/login`；
+* `/api/login` 是一个 Cloudflare Pages Function（`site/functions/api/login.js`），
+  它把每次提交记录为一条事件写入 KV 绑定 `HP`，然后返回千篇一律的
+  `500 {"ok":false}` —— 不回显、不计数、不区分成功与失败，攻击者得不到任何
+  反馈；
+* 每条事件包含：UTC 时间、来源 IP（`CF-Connecting-IP`，XFF 只作补充记录）、
+  User-Agent、提交的字段（用户名/密码/来源页）、请求头白名单、CF ray/colo/
+  国家/ASN。响应与存储里都不含 cookie，不捕获会话；
+* 单事件 ≤4 KB、超长截断；单 IP 每小时 ≤20 条（KV 计数器限流）；事件保留
+  30 天后自动过期；
+* `robots.txt` 列出这些路径 — 这是有意的：爬虫与漏洞扫描器会顺着进来，真人
+  几乎不会。这些链接以隐藏方式挂在 index.html 页脚（`display:none`），只对
+  解析 HTML 找链接的自动化工具可见。
 
-这些链接以隐藏方式挂在 index.html 页脚（`display:none`），只对解析 HTML
-找链接的自动化工具可见。
+### 隐私与边界
+
+* 采集对象是**攻击者的提交内容**，这是蜜罐的目的数据；请求头用白名单，
+  不收集 cookie 或 bearer token，避免把第三方凭据存进自己的存储；
+* 读路径不存在：KV 只能通过 Cloudflare 控制台或 wrangler（账号凭据）访问，
+  网站上没有任何读取接口；
+* 代码在 git 里、由托管平台部署，修改仍然只能通过提交完成。
+
+### 对接网安流程
+
+```bash
+# 一次性：npm i -g wrangler 并登录（wrangler login）
+node tools/honeypot-export.mjs --since 2025-11-01 --out hits.ndjson
+# 可选：导出后删除已导出的键（KV 也会 30 天自动过期）
+node tools/honeypot-export.mjs --delete
+```
+
+`hits.ndjson` 每行一个 JSON 事件，可直接投喂 SIEM/SOC 管道。IP 维度的
+统计、与 Cloudflare 自带请求日志的关联（用事件里的 `ray`/`colo` 字段）、
+封禁决策由接收方完成。
+
+### KV 绑定配置（部署时一次性）
+
+Cloudflare Dashboard → 该 Pages 项目 → Settings → Functions → KV namespace
+bindings：新建/选择一个 namespace，绑定变量名填 `HP`。或者：
+
+```bash
+npx wrangler kv namespace create HP
+# 按输出提示把 namespace_id 绑定到 Pages 项目（Dashboard 或 wrangler pages ...）
+```
+
+未绑定 `HP` 时端点返回同样的 500，蜜罐页面照常工作，只是不落盘。
 
 ## 边界声明
 
@@ -81,5 +119,5 @@ Pages 自动构建并发布。每一次变更都在 git 历史里，可审计、
 * 启动器默认**不启用**通知功能，首次启动会询问一次，默认答案为否；
 * 启动器对 `http://` 地址会提示明文风险；`feed.json` 应始终通过 `https://`
   分发（pages.dev 默认即 HTTPS）；
-* 本站与 Cloudflare 之间没有任何自定义后端 — 如果未来需要动态能力
-  （例如按版本下发不同公告），应重新评估而非就地加接口。
+* `/api/login` 是站点唯一的动态端点，只写不读、无任何查询能力；如果未来
+  需要更多动态能力，应重新评估而非就地加接口。
