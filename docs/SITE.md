@@ -61,6 +61,30 @@ Pages 自动构建并发布。每一次变更都在 git 历史里，可审计、
 发布新版本时：更新 `latest`、把新版本说明作为一条 note 加到数组**前面**
 （启动器按顺序显示），保留旧 note 若干条以便老启动器仍能看到历史。
 
+## 房间号注册表
+
+`site/functions/api/room.js` 是"房间号联机"的注册表：房主把 `房号 → 地址:端口`
+登记十分钟，朋友用房号换回地址后直连。**游戏流量不经过它**，它只是短暂的
+会合点。
+
+| 端点 | 作用 |
+|---|---|
+| `POST /api/room` | 注册/续期，body `{"code","addr","port"}` |
+| `GET /api/room/<CODE>` | 查询，返回 `{"ok":true,"addr","port"}` |
+
+* 房号 6 字符，字母表 `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` —— 剔除 `I/O/0/1`，
+  因为房号是念出来或看截图输入的，这四个最容易被听错/看错；
+* 服务端对房号和地址都做**白名单校验后才碰 KV 键**；客户端（`src/room.rs`
+  的 `checked_addr`）重复同一套白名单，不依赖部署行为；
+* 限流：注册 10 次/分、查询 60 次/分（按 IP，计数器 120 秒过期）；
+* 错误只返回枚举 `bad_code`/`bad_request`/`not_found`/`rate_limited`/
+  `server_error`，不回显请求内容；
+* 记录里**不含来源 IP**（只有限流计数器短暂保存），房号 600 秒自动过期，
+  没有删除端点和历史记录。
+
+KV 绑定名 **`ROOMS`**。启动器侧可用 `Settings.room_server` 覆盖默认地址，
+且只在用户点"建房号/用房间号连接"时才访问——启动时从不联系。
+
 ## 蜜罐（私有部署，不在公开仓库）
 
 蜜罐由两部分组成，**两部分都不在公开仓库里**：
@@ -110,6 +134,20 @@ node tools/honeypot-export.mjs --delete
 封禁决策由接收方完成。
 
 ### KV 绑定配置（部署时一次性）
+
+**介绍站需要两个 KV 绑定**（房间号注册表用）：
+
+```bash
+npx wrangler kv namespace create ROOMS
+# 输出里的 id 填到 Dashboard → Pages 项目 lightfoxlauncher →
+#   Settings → Bindings → 添加 KV namespace，变量名必须精确为 ROOMS
+```
+
+绑定后重新部署一次生效（`npx wrangler pages deploy site --project-name
+lightfoxlauncher --branch main`）。未绑定时 `/api/room` 返回
+`{"ok":false,"error":"server_error"}`，其余页面照常工作。
+
+**蜜罐项目单独一个绑定**（`HP`）：
 
 ```bash
 npx wrangler kv namespace create HP
