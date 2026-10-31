@@ -13,3 +13,6 @@
 
 # Private honeypot deployment: never published to the public repository
 /private-site/
+
+# wrangler local cache (deployment metadata, not for the repo)
+.wrangler/
