@@ -2126,16 +2126,26 @@ fn host_detect_now(app: &mut App) {
             ..Default::default()
         };
         r.firewall_ok = lightfox::firewall::rule_exists();
-        if net.v6_global.is_empty() {
+        
+        // IPv6 status (primary solution for modern networks)
+        if !net.v6_global.is_empty() {
+            r.notes.insert(0, format!(
+                "✅ IPv6 全球地址可用（{count}个），这是推荐的联机方式",
+                count = net.v6_global.len()
+            ));
+        } else {
             r.notes.push("未检测到全球 IPv6 地址。若宽带支持 IPv6，检查路由器是否开启 IPv6 前缀分发。".to_string());
         }
+        
+        // IPv4 status (fallback solution)
         if net.v4_gateways.is_empty() {
             r.notes.push("未找到 IPv4 默认网关；无法尝试 UPnP/NAT-PMP。".to_string());
         } else {
             r.notes.push(format!("IPv4 网关：{}（端口映射尝试的目标）", net.v4_gateways[0]));
         }
+        
         r.notes.push(format!(
-            "检测完成（目标端口 {port}）。点“开服（映射端口）”开始联机配置。"
+            "检测完成（目标端口 {port}）。点“开服（映射端口）”应用防火墙设置并尝试端口映射。"
         ));
         HostMsg::Detect(r)
     });

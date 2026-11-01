@@ -1683,7 +1683,7 @@ mod tests {
         assert!(e.starts_with("net: "), "must be a net error: {e}");
         // The status is `u32` and the body `Vec<u8>`, matching `post_json`;
         // this compiles only while that stays true.
-        fn _shape(f: fn(&str, usize) -> Res<(u32, Vec<u8>)>) {}
+        fn _shape(_f: fn(&str, usize) -> Res<(u32, Vec<u8>)>) {}
         _shape(get_with_status);
     }
 

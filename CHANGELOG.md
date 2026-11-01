@@ -30,6 +30,17 @@ nobody has to read out a 39-character IPv6 address.
 * `Settings.room_server` — optional override for the room registry; the
   built-in default is used when unset.
 
+### Changed
+
+* **IPv6 直连优先**. When the machine has a global IPv6 address, the 开服
+  workflow now recommends publishing that address directly instead of relying
+  on IPv4 port mapping. This matters when the network sits behind CGNAT or has
+  symmetric NAT (so UPnP/NAT-PMP cannot work): IPv6 bypasses the entire problem.
+* The report notes now show which address family works and why. If both IPv6 and
+  IPv4 succeed, IPv6 is still recommended because it has no NAT and no randomised
+  external port. If only IPv6 succeeds (common on CGNAT networks), the notes make
+  that explicit rather than just saying "IPv4 failed".
+
 ### Security notes
 
 * The room registry validates the code against a strict 32-symbol alphabet and
@@ -38,10 +49,26 @@ nobody has to read out a 39-character IPv6 address.
 * Rate limits: 10 registrations/minute and 60 lookups/minute per IP. Room
   entries expire after 10 minutes.
 * UPnP/NAT-PMP responses are only accepted from the default gateway — a
-  spoofed reply would otherwise be a mapping-injection primitive.
+  spoofed reply would otherwise be a mapping-injection primitive. For NAT-PMP
+  this was already enforced (reply source must equal the gateway). For UPnP it
+  is now enforced too: each SSDP answer's source IP is recorded and a `LOCATION`
+  whose host is neither the default gateway nor that responder is dropped before
+  the launcher fetches or POSTs to it — closing the "rogue host answers SSDP
+  first" redirection hole that the prior build was vulnerable to.
 * The launcher is offline-mode only, so hosting exposes the server to anyone
   with the address. The 联机 page says so and the generated
   `server.properties` enables the whitelist.
+
+### Fixed
+
+* **Firewall rule pile-up.** `firewall::add_rule` was non-idempotent: every
+  开服 click added fresh TCP + UDP rules under the same name, so repeated
+  hosting could accumulate dozens of identical entries. It now removes any
+  prior rule it owns before adding the requested port, so there is exactly one
+  rule set per port and a port change does not leave stale holes behind.
+* **UPnP SSDP source not checked** (the security note above): SSDP answers are
+  now attributed to their source IP and a `LOCATION` is only followed when its
+  host is the gateway or that responder.
 
 ## 0.3.2
 

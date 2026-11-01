@@ -15,8 +15,8 @@ no login server, no runtime dependencies — just the game.
 
 | Binary | Size | What it is |
 |---|---|---|
-| `LFL-gui.exe` | **657,920 B (0.63 MiB)** | native Win32 window: pick version, click play |
-| `LFL.exe` | **524,800 B (0.50 MiB)** | command line, scriptable |
+| `LFL-gui.exe` | **739,328 B (0.70 MiB)** | native Win32 window: pick version, click play |
+| `LFL.exe` | **526,848 B (0.50 MiB)** | command line, scriptable |
 
 ```
 LFL-gui.exe             # the window
@@ -32,7 +32,7 @@ Both binaries drive the same `lightfox` library: the GUI never re-implements a d
 
 ## The window
 
-Seven pages, a tab bar, and nothing else:
+Eight pages, a tab bar, and nothing else:
 
 | Page | What it does |
 |---|---|
@@ -43,6 +43,7 @@ Seven pages, a tab bar, and nothing else:
 | **设置** | download threads, Java path, 查找 Java |
 | **工具** | verify files, clean logs, delete partials, open folder, copy command, multi-threaded downloader |
 | **通知** | announcements and launcher-update check, from a feed URL you configure |
+| **联机** | detect network (IPv6/IPv4 reachability, firewall rule), host a server (UPnP/NAT-PMP port mapping or publish IPv6 directly), and a 6-char room code so friends join without typing an IPv6 address |
 
 The chrome is owner-drawn with GDI: a rounded accent brand mark beside the name, pill-shaped tabs
 with an accent bar under the active one, a **card behind every group of controls** with a bold
@@ -294,7 +295,7 @@ what keeps it well under a megabyte instead of the several megabytes a Rust GUI 
 `src/gui/win32.rs`); all launcher logic is safe Rust. The release profile is tuned for size:
 `opt-level="z"`, `lto=true`, `codegen-units=1`, `panic="abort"`, `strip=true`.
 
-Measured: 238 unit tests, all offline (no network needed); the 620 KB asset index parses in ~3 ms.
+Measured: 306 unit tests (6 network tests ignored), all offline (no network needed); the 620 KB asset index parses in ~3 ms.
 
 ## What it does
 
@@ -323,6 +324,34 @@ name and the standard deterministic offline UUID
 ```powershell
 LFL --user Steve
 ```
+
+## 联机 / Play together
+
+The **联机** tab hosts a server and lets friends join without anyone reading out a 39-character IPv6 address.
+
+* **检测网络** (read-only) reports what this machine can host: globally-routable IPv6
+  addresses, the IPv4 gateway, and whether the firewall rule exists. Nothing is changed.
+* **开服（映射端口）** adds the firewall rule, then tries a port mapping — UPnP IGD first,
+  falling back to NAT-PMP (RFC 6886) only when UPnP found no gateway. A 4-hour lease is
+  requested, with a retry as a permanent lease when the router answers error 725. 关闭映射
+  tears it down again.
+* **IPv6 直连优先.** When the machine has a global IPv6 address, publishing that address
+  directly is recommended over IPv4 port mapping. This is what makes hosting work on CGNAT or
+  symmetric-NAT networks where UPnP/NAT-PMP cannot — IPv6 bypasses NAT entirely. If both
+  families work, IPv6 is still preferred (no NAT, no randomised external port); if only IPv6
+  works, the report says so explicitly.
+* **房间号** — a 6-character code (32-symbol alphabet, no I/0/1 lookalikes) maps to the
+  host's `addr:port` for 10 minutes, so friends type `ABC234` instead of an IPv6 address. The
+  registry is a Cloudflare Pages Function over KV; it stores only `code → addr:port` and never
+  proxies game traffic. `servermod` builds the server jar, `eula.txt`, an offline-mode
+  `server.properties` (with the whitelist enabled), and a `whitelist.json` from offline-mode
+  UUIDs.
+
+Security: the room registry validates the code against a strict 32-symbol alphabet and the
+address against an IPv6/IPv4 character set before storing; UPnP/NAT-PMP replies are only
+accepted from the default gateway; and because the launcher is offline-mode only, hosting
+exposes the server to anyone with the address — the 联机 page says so and the generated
+`server.properties` enables the whitelist. See [CHANGELOG.md](CHANGELOG.md) for the full notes.
 
 ## Verified end to end
 
@@ -452,7 +481,7 @@ launcher crashes — it can never go stale. Instance names are validated to stay
 
 ```
 cargo build --release      # builds both binaries
-cargo test                 # 238 offline unit tests, no network needed
+cargo test                 # 306 offline unit tests (6 network tests ignored), no network needed
 ```
 
 Requires stable Rust with the MSVC toolchain. Windows 8.1+ (WinHTTP). No other build inputs.

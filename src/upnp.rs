@@ -77,6 +77,12 @@ impl core::fmt::Display for UpnpErr {
 struct SsdpHit {
     /// Base URL of the device description, e.g. `http://192.168.1.1:5000/igd.xml`.
     location: String,
+    /// The IPv4 that actually answered SSDP. SSDP is unauthenticated UDP, so a
+    /// hostile host on the LAN can answer faster than the real router; we only
+    /// follow a LOCATION whose host is this responder (or the default gateway,
+    /// which is the address the router advertises from). Anything else is a
+    /// redirection primitive and is dropped.
+    from: Ipv4Addr,
 }
 
 /// The ST values worth searching for, in priority order. `ssdp:all` floods
@@ -111,7 +117,7 @@ fn ssdp_discover() -> Vec<SsdpHit> {
         .parse()
         .expect("constant parses");
 
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: Vec<SsdpHit> = Vec::new();
     for st in SEARCH_TARGETS {
         let packet = msearch(st);
         if sock.send_to(packet.as_bytes(), multicast).is_err() {
@@ -127,23 +133,28 @@ fn ssdp_discover() -> Vec<SsdpHit> {
             }
             let _ = sock.set_read_timeout(Some(deadline - now));
             match sock.recv_from(&mut buf) {
-                Ok((n, _from)) => {
-                    let text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                Ok((n, from)) => {
+                    // Only IPv4 responders matter here; an IPv6 SSDP source is
+                    // not a router we are doing IGD mapping against.
+                    let Ok(from) = from.ip().to_string().parse::<Ipv4Addr>() else {
+                        continue;
+                    };
                     // Case-insensitive header scan; LOCATION value keeps its case.
                     for line in String::from_utf8_lossy(&buf[..n]).lines() {
                         if let Some(v) = line.trim().strip_prefix("location:").map(str::trim) {
-                            if !v.is_empty() && !seen.iter().any(|s| s.eq_ignore_ascii_case(v)) {
-                                seen.push(v.to_string());
+                            if !v.is_empty()
+                                && !seen.iter().any(|s| s.location.eq_ignore_ascii_case(v))
+                            {
+                                seen.push(SsdpHit { location: v.to_string(), from });
                             }
                         }
                     }
-                    let _ = text; // scanned above
                 }
                 Err(_) => break, // timeout for this ST
             }
         }
     }
-    seen.into_iter().map(|location| SsdpHit { location }).collect()
+    seen
 }
 
 // ---------------------------------------------------------------- HTTP over TCP
@@ -369,13 +380,47 @@ fn find_control(doc_url: &str, doc: &str) -> Option<IgdControl> {
     fallback
 }
 
+/// The host portion of a `http://host[:port]/path` URL, or None if it is not
+/// plain http (we never talk TLS to a router, and https would be a tell-tale
+/// of a spoofed LOCATION).
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("http://")?;
+    let hostport = match rest.find('/') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let host = hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport);
+    Some(host.to_string())
+}
+
+/// True when `host` is the default gateway or the SSDP responder itself — the
+/// only two addresses a legitimate IGD description may live on. SSDP is
+/// unauthenticated, so a rogue LAN host could claim any LOCATION; we refuse to
+/// connect to anything outside this set (CHANGELOG: UPnP responses only from
+/// the gateway). Without this, a faster attacker answer redirects the
+/// privileged request to an attacker-controlled box.
+fn location_acceptable(host: &str, from: Ipv4Addr, gateways: &[String]) -> bool {
+    if host == from.to_string() {
+        return true;
+    }
+    gateways.iter().any(|g| g == host)
+}
+
 /// Discover a control endpoint: SSDP, then description fetch, then parse.
 fn discover_control() -> Result<IgdControl, UpnpErr> {
     let hits = ssdp_discover();
     if hits.is_empty() {
         return Err(UpnpErr::NoGateway);
     }
+    let gateways = hostnet::detect().v4_gateways;
     for h in &hits {
+        // Enforce the gateway-source rule before we even fetch the description.
+        let Some(host) = url_host(&h.location) else {
+            continue; // not plain http — reject
+        };
+        if !location_acceptable(&host, h.from, &gateways) {
+            continue; // rogue LOCATION — do not follow it
+        }
         if let Ok(doc) = http_get(&h.location) {
             if let Some(ctl) = find_control(&h.location, &doc) {
                 return Ok(ctl);
@@ -659,5 +704,27 @@ mod tests {
         assert!(s.contains("冲突") && s.contains("718"));
         let e = UpnpErr::NoGateway;
         assert!(e.to_string().contains("UPnP") && e.to_string().contains("CGNAT"));
+    }
+
+    #[test]
+    fn url_host_extracts_host_only() {
+        assert_eq!(url_host("http://192.168.1.1/igd.xml").as_deref(), Some("192.168.1.1"));
+        assert_eq!(url_host("http://192.168.1.1:5000/ctl").as_deref(), Some("192.168.1.1"));
+        assert_eq!(url_host("https://192.168.1.1/x"), None, "https LOCATION is rejected");
+        assert_eq!(url_host("not-http://x"), None);
+    }
+
+    #[test]
+    fn location_only_accepted_from_gateway_or_responder() {
+        let gw = "192.168.1.1".to_string();
+        let gates = vec![gw.clone()];
+        // Real router: its own address answered SSDP.
+        assert!(location_acceptable("192.168.1.1", "192.168.1.1".parse().unwrap(), &gates));
+        // SSDP came from the gateway, LOCATION points at the gateway too.
+        assert!(location_acceptable("192.168.1.1", "192.168.1.254".parse().unwrap(), &gates));
+        // Rogue: answered SSDP from .50 but points the description at .99.
+        assert!(!location_acceptable("10.0.0.99", "192.168.1.50".parse().unwrap(), &gates));
+        // Rogue: points at an unrelated host that is not the gateway at all.
+        assert!(!location_acceptable("8.8.8.8", "192.168.1.50".parse().unwrap(), &gates));
     }
 }
