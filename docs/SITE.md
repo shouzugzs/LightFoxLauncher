@@ -140,16 +140,40 @@ node tools/honeypot-export.mjs --delete
 
 ### KV 绑定配置（部署时一次性）
 
-**介绍站需要两个 KV 绑定**（房间号注册表用）：
+**介绍站的房间注册表需要一个 KV 绑定 `ROOMS`**：
 
 ```bash
 npx wrangler kv namespace create ROOMS
-# 输出里的 id 填到 Dashboard → Pages 项目 lightfoxlauncher →
-#   Settings → Bindings → 添加 KV namespace，变量名必须精确为 ROOMS
+# 把输出的 id 填进 site/wrangler.toml 的 [[kv_namespaces]] id=
 ```
 
-绑定后重新部署一次生效（`npx wrangler pages deploy site --project-name
-lightfoxlauncher --branch main`）。未绑定时 `/api/room` 返回
+**部署必须从 `site/` 目录内部执行**：
+
+```bash
+cd site
+npx wrangler pages deploy . --project-name lightfoxlauncher --branch main
+```
+
+输出里必须出现 `✨ Uploading Functions bundle` 这一行——没有它说明
+`functions/` 没被打包，`/api/room` 会落到静态 404 页。
+
+> 为什么不是从仓库根目录 `deploy site`：`wrangler pages deploy <dir>` 在
+> **当前工作目录**下找 `functions/`，不是在被部署的目录里。从根目录执行时
+> 它只上传静态文件、静默跳过 room.js，端点就变成了 404 页面——这个坑踩过
+> 一次，`site/wrangler.toml` 和上面的命令把正确形态固定下来。
+
+KV 绑定也可以用 API 一次性设置到项目配置（比 Dashboard 点选更可重复）：
+
+```bash
+TOKEN=$(grep oauth_token ~/.config/.wrangler/config/default.toml | cut -d'"' -f2)
+ACC=<account id>
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  "https://api.cloudflare.com/client/v4/accounts/$ACC/pages/projects/lightfoxlauncher" \
+  -d '{"deployment_configs":{"production":{"kv_namespaces":{"ROOMS":{"namespace_id":"<id>"}}},
+       "preview":{"kv_namespaces":{"ROOMS":{"namespace_id":"<id>"}}}}}'
+```
+
+绑定后必须重新部署一次才生效。未绑定时 `/api/room` 返回
 `{"ok":false,"error":"server_error"}`，其余页面照常工作。
 
 **蜜罐项目单独一个绑定**（`HP`）：
