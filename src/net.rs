@@ -571,13 +571,44 @@ impl Session {
             ));
         }
         if let Some(h) = headers {
-            // A header string is passed to `WinHttpSendRequest` verbatim; the
-            // only caller builds `Range: bytes=N-` plus one CRLF, so strip that
-            // terminator and require the rest to be a single control-free line.
-            // Anything else is a bug worth stopping rather than sending.
-            let body = h.strip_suffix("\r\n").unwrap_or(h);
-            if body.chars().any(|c| c.is_control()) {
+            // A header string is passed to `WinHttpSendRequest` verbatim, so it
+            // must be a sequence of well-formed `Name: value` lines. CRLF is
+            // legal **only** as the separator between those lines (and as the
+            // terminator): any other control character — or a bare CR or LF not
+            // part of a CRLF pair — would let a value spill into the request
+            // body or forge an extra header.
+            //
+            // This used to require the whole string to be control-free, which
+            // was right when the only caller sent a single `Range:` header and
+            // wrong the moment a second header was added: post_json's
+            // "Content-Type: ...\r\nAccept: ...\r\n" was rejected as malformed.
+            if h.chars().any(|c| c.is_control() && c != '\r' && c != '\n') {
                 return Err("net: refusing to send malformed request headers".to_string());
+            }
+            // Every CR must be followed by LF, and every LF preceded by CR:
+            // that admits only CRLF pairs, never a lone one.
+            let bytes = h.as_bytes();
+            for (i, b) in bytes.iter().enumerate() {
+                match *b {
+                    b'\r' if bytes.get(i + 1) != Some(&b'\n') => {
+                        return Err("net: refusing to send malformed request headers".to_string());
+                    }
+                    b'\n' if i == 0 || bytes.get(i - 1) != Some(&b'\r') => {
+                        return Err("net: refusing to send malformed request headers".to_string());
+                    }
+                    _ => {}
+                }
+            }
+            // A header line must be `name: value`; an empty line inside the
+            // block would terminate the headers early. Only the single
+            // trailing CRLF is the terminator — `trim_end_matches` would eat
+            // every trailing CRLF and hide exactly the empty line this is
+            // meant to catch.
+            let block = h.strip_suffix("\r\n").unwrap_or(h);
+            for line in block.split("\r\n") {
+                if line.is_empty() || !line.contains(':') {
+                    return Err("net: refusing to send malformed request headers".to_string());
+                }
             }
         }
         let agent = util::to_wide(AGENT);
@@ -1598,9 +1629,30 @@ mod tests {
         let e = err(Session::open_with(&ok, Some("Range: bytes=0-\r\n")));
         assert!(!e.is_empty(), "must fail to connect");
         assert!(!e.contains("malformed request headers"), "{e}");
-        // A header carrying an embedded second line is refused.
-        let e = err(Session::open_with(&ok, Some("Range: bytes=0-\r\nX-Evil: 1\r\n")));
-        assert!(e.contains("malformed request headers"), "{e}");
+        // Multiple well-formed header lines are legal — this is what
+        // post_json sends ("Content-Type" + "Accept"). They get as far as the
+        // connection attempt.
+        let e = err(Session::open_with(
+            &ok,
+            Some("Content-Type: application/json\r\nAccept: application/json\r\n"),
+        ));
+        assert!(!e.contains("malformed request headers"), "{e}");
+        // What must NOT get through: a bare CR or LF (header injection), a
+        // line that is not `name: value`, and an empty line that would end the
+        // header block early.
+        for bad in [
+            "Range: bytes=0-\rX-Evil: 1\r\n",       // lone CR
+            "Range: bytes=0-\nX-Evil: 1\r\n",       // lone LF
+            "Range: bytes=0-\r\n\r\nX-Evil: 1\r\n", // empty line = early end
+            "Range: bytes=0-\r\nNoColonHere\r\n",   // not a header line
+            "Range: bytes=0-\r\n\r\n",              // empty line
+        ] {
+            let e = err(Session::open_with(&ok, Some(bad)));
+            assert!(
+                e.contains("malformed request headers"),
+                "{bad:?} should be refused, got {e}"
+            );
+        }
     }
 
     #[test]

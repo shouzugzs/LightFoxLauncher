@@ -1,0 +1,16 @@
+# Cloudflare Pages config for the intro site + room registry.
+#
+# Deploy from inside this directory:
+#   cd site && npx wrangler pages deploy . --project-name lightfoxlauncher --branch main
+#
+# `functions/` must sit beside the deployed directory root — that is why this
+# file lives here and the deploy runs from `site/`, not from the repo root.
+# The room registry needs the ROOMS KV binding; without it /api/room answers
+# {"ok":false,"error":"server_error"} and nothing is stored.
+
+name = "lightfoxlauncher"
+compatibility_date = "2025-10-01"
+
+[[kv_namespaces]]
+binding = "ROOMS"
+id = "a86e410252a94cd5b0b0d00339a828a4"
