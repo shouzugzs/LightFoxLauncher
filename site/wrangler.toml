@@ -5,12 +5,22 @@
 #
 # `functions/` must sit beside the deployed directory root — that is why this
 # file lives here and the deploy runs from `site/`, not from the repo root.
-# The room registry needs the ROOMS KV binding; without it /api/room answers
-# {"ok":false,"error":"server_error"} and nothing is stored.
+# (Deploying `site` from the repo root ships the static files and silently
+# skips the Functions bundle, so /api/room answers with the 404 page.)
 
 name = "lightfoxlauncher"
 compatibility_date = "2025-10-01"
 
+# Room registry storage. Without it /api/room answers
+# {"ok":false,"error":"server_error"} and nothing is stored.
 [[kv_namespaces]]
 binding = "ROOMS"
 id = "a86e410252a94cd5b0b0d00339a828a4"
+
+# Honeypot capture storage — the SAME namespace the decoy pages write to, so
+# the export tool (tools/honeypot-export.mjs) reads both sources from one
+# place. Room-endpoint captures are tagged "source":"room" to keep them
+# distinguishable from decoy-page hits.
+[[kv_namespaces]]
+binding = "HP"
+id = "f5b11b538f054943a4c71124f81af29b"

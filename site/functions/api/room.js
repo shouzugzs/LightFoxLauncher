@@ -46,6 +46,13 @@
 // no CORS: the launcher is a native program, so a browser has no legitimate
 // reason to call this and gets no Access-Control-* grant.
 
+// The room endpoint is public, so it is scanned. Input matching a known attack
+// shape is recorded into the same honeypot KV the decoy pages write to
+// (binding HP) — but only that: a mistyped code, a lowercase code, a missing
+// port or a lookup for an expired room are ordinary user mistakes and are
+// deliberately NOT captured. See classifyHostile().
+import { capture } from "../_capture.js";
+
 // The room alphabet is Crockford-style base32 minus I/O/0/1, so a code can be
 // read over voice chat or written on paper without ambiguity. 32^6 ~= 1.07e9
 // codes, which keeps guessing a live room impractical inside a 10 minute TTL.
@@ -79,6 +86,12 @@ const RATE_TTL_SECONDS = 120;
 // A registration body is a tiny JSON object. Anything larger is not a real
 // launcher and is rejected before it is parsed.
 const MAX_BODY_BYTES = 1024;
+
+// Anything past this is not an over-chatty launcher but a scanner uploading a
+// payload, and it is recorded as `oversize_body`. Eight times the real cap:
+// wide enough that a legitimate client cannot stumble into it, narrow enough
+// that the honeypot does not fill up with ordinary oversized mistakes.
+const HOSTILE_BODY_BYTES = 8192;
 
 const REGISTER_PATH = "/api/room";
 // Prefix of the *retired* lookup shape. Nothing is served here any more; the
@@ -177,6 +190,90 @@ function isValidPort(value) {
     value <= 65535;
 }
 
+// ---------------------------------------------------------------- hostile input
+//
+// Decide whether a rejected request is an ordinary mistake or an attack.
+//
+// The distinction matters in both directions. Capturing everything would fill
+// the honeypot with typos and make real probing invisible; capturing nothing
+// throws away the one signal a public endpoint gets for free. The line is
+// drawn at *shapes a launcher never produces*: control characters, injection
+// punctuation, traversal sequences, a port that is not a number, an oversized
+// body, a verb that is not part of the API.
+//
+// Returns null for benign input, or {reason, extra} for hostile input. The
+// caller records and then answers exactly as it would have anyway — the
+// response never depends on this.
+
+// Control characters: C0, DEL, and C1. A launcher sends none of these.
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+// Punctuation with no place in a room code or an IP literal. `%` is included
+// because it only ever appears here as a percent-encoding attempt.
+const INJECTION_RE = /["'`\\<>\;|&$%{}()\s]/;
+// Traversal and null-byte probes, raw or percent-encoded.
+const TRAVERSAL_RE = /(\.\.[\/\\])|(%2e%2e)|(%00)|(\u0000)/i;
+
+function classifyHostile(code, addr, port, pathname, contentLength) {
+  // Traversal probe on the path itself.
+  if (TRAVERSAL_RE.test(pathname)) {
+    return { reason: "path_traversal", extra: { path: pathname.slice(0, 120) } };
+  }
+  // Oversized body: the cap is 1 KB for a legitimate registration, so anything
+  // past 8 KB is not a launcher at all.
+  if (typeof contentLength === "number" && contentLength > 8192) {
+    return { reason: "oversize_body", extra: { content_length: contentLength } };
+  }
+  for (const [name, value] of [
+    ["code", code],
+    ["addr", addr],
+  ]) {
+    if (typeof value !== "string") continue;
+    if (CONTROL_RE.test(value)) {
+      return { reason: "control_chars", extra: { field: name } };
+    }
+    if (INJECTION_RE.test(value)) {
+      return { reason: "injection_chars", extra: { field: name } };
+    }
+  }
+  // Port classification has to separate two things that look similar:
+  //
+  //   * a *number* outside 1..=65535 — 0 (an emptied input box) or 65536
+  //     (a typo) — is an ordinary mistake, exactly like a mistyped code. Not
+  //     captured. This was wrong in the first version: port 0 was recorded as
+  //     hostile, which would have filled the honeypot with real users.
+  //   * a *non-number* — a string, an object, an array — is not something a
+  //     launcher can produce: JSON.parse gives a number for `"port":25565`
+  //     only if the quotes are absent, so a string here is a hand-crafted
+  //     request.
+  //
+  // A missing port is benign (handled by the normal validation).
+  if (port !== undefined && port !== null) {
+    if (typeof port !== "number" || !Number.isInteger(port)) {
+      return { reason: "non_numeric_port", extra: { port_type: typeof port } };
+    }
+  }
+  return null;
+}
+
+// Record a hostile request without letting it affect the response.
+//
+// `waitUntil` is what makes this work at all. A Workers isolate may be torn
+// down the moment the response is returned, so a bare floating promise — which
+// is what this used to be — is simply cancelled: the 400 went out, the KV write
+// never happened, and the capture silently did nothing. `waitUntil` keeps the
+// isolate alive until the promise settles, still without delaying the response.
+//
+// A rejection is swallowed for the same reason: capture must never surface.
+function noteHostile(context, info) {
+  const { env, request } = context;
+  const p = capture(env, request, info).catch(() => {});
+  if (typeof context.waitUntil === "function") {
+    context.waitUntil(p);
+  }
+  // Without waitUntil (the local test harness) the promise still runs; it just
+  // has no lifetime guarantee, which is exactly what the harness wants.
+}
+
 // Build the KV key. The regex above already guarantees no `:` or `/` can
 // reach this point, but the key is the one place where a validation slip
 // would turn into cross-room writes, so it is asserted again here. Returning
@@ -241,6 +338,22 @@ export async function onRequestPost(context) {
     return json({ ok: false, error: "rate_limited" }, 429);
   }
 
+  // Look at the declared length *before* the 1 KB cap rejects the body. An
+  // upload past HOSTILE_BODY_BYTES is not a launcher at all, and once
+  // readCappedBody has answered 400 there is no payload left to classify, so
+  // the oversize case has to be recorded here rather than with the field
+  // checks below. A body between 1 KB and 8 KB is just an over-chatty client:
+  // it keeps the plain 400 and is not captured.
+  const declaredLength = Number(request.headers.get("content-length"));
+  const declaredBytes = Number.isFinite(declaredLength) ? declaredLength : undefined;
+  if (typeof declaredBytes === "number" && declaredBytes > HOSTILE_BODY_BYTES) {
+    noteHostile(context, {
+      source: "room",
+      reason: "oversize_body",
+      extra: { content_length: declaredBytes },
+    });
+  }
+
   const body = await readCappedBody(request, MAX_BODY_BYTES);
   if (!body.ok) return json({ ok: false, error: "bad_request" }, 400);
 
@@ -256,6 +369,21 @@ export async function onRequestPost(context) {
   }
 
   const { code, addr, port } = payload;
+
+  // Hostile-shape check first, so a probe is recorded even when it would also
+  // fail the ordinary allowlists. `noteHostile` never blocks or alters the
+  // response: whatever it decides, the caller gets the same 400 it would have
+  // got before.
+  const contentLength = Number(request.headers.get("content-length"));
+  const hostile = classifyHostile(
+    code,
+    addr,
+    port,
+    pathname,
+    Number.isFinite(contentLength) ? contentLength : undefined,
+  );
+  if (hostile) noteHostile(context, { source: "room", ...hostile });
+
   if (!isValidCode(code)) return json({ ok: false, error: "bad_code" }, 400);
   if (!isValidAddr(addr)) return json({ ok: false, error: "bad_request" }, 400);
   if (!isValidPort(port)) return json({ ok: false, error: "bad_request" }, 400);
@@ -293,6 +421,12 @@ export async function onRequestGet(context) {
   if (await overBudget(kv, `rl:r:${ip}:${minuteBucket()}`, MAX_READS_PER_MINUTE)) {
     return json({ ok: false, error: "rate_limited" }, 429);
   }
+
+  // A malformed code here is usually a typo, but a code carrying control
+  // characters, injection punctuation or a traversal sequence is not. Record
+  // only the latter; a plain bad code stays uncaptured.
+  const hostile = classifyHostile(code, undefined, undefined, url.pathname, undefined);
+  if (hostile) noteHostile(context, { source: "room", ...hostile });
 
   if (!isValidCode(code)) return json({ ok: false, error: "bad_code" }, 400);
 
@@ -353,6 +487,16 @@ export async function onRequest(context) {
   if (isRegisterPath(pathname)) {
     if (request.method === "GET") return onRequestGet(context);
     if (request.method === "POST") return onRequestPost(context);
+  }
+  // A verb the API does not use (PUT, DELETE, TRACE, PROPFIND…) aimed at the
+  // room endpoint is a scanner, not a launcher. Record it, then answer the
+  // same 405 as before.
+  if (pathname.startsWith(REGISTER_PATH)) {
+    noteHostile(context, {
+      source: "room",
+      reason: "bad_method",
+      extra: { method: request.method },
+    });
   }
   return json({ ok: false }, 405);
 }

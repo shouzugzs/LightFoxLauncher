@@ -90,6 +90,56 @@ Function。旧路径形式现在返回 `400 bad_request`（不是 405，也不�
 KV 绑定名 **`ROOMS`**。启动器侧可用 `Settings.room_server` 覆盖默认地址，
 且只在用户点"建房号/用房间号连接"时才访问——启动时从不联系。
 
+### 恶意探测捕获（对接蜜罐）
+
+房间端点是公开的，扫描器一定会探测它。良性错误（房号打错、长度不对、端口
+为空、查询不存在的房号）**不记录**——那是真实用户，记录下来只会淹没数据。
+只有**明确恶意**的输入才写进蜜罐 KV（绑定 `HP`，与诱饵页同一个 namespace）：
+
+| 特征 `reason` | 触发条件 |
+|---|---|
+| `control_chars` | 房号或地址含 `\x00`–`\x1f`、`\x7f` |
+| `injection_chars` | 含 `" ' \ < > ; \| & \` $ % { } ( )` 空格换行 |
+| `path_traversal` | 路径含 `..`、`%2e%2e`、`%00` |
+| `non_numeric_port` | 端口是字符串/负数/越界 |
+| `oversize_body` | 请求体超过 8192 字节 |
+| `bad_method` | 非 GET/POST 且路径以 `/api/room` 开头 |
+
+实现要点：
+
+* **必须用 `context.waitUntil()`**，不能只写一个游离的 Promise。Workers 在返回
+  响应的瞬间就可能销毁 isolate，未完成的 Promise 会被直接取消——实测过：响应
+  正常返回 400，但 KV 里一条记录都没有，捕获静默失效。`waitUntil` 让 isolate
+  活到写入完成，同时**不拖慢响应**，攻击者依然无法从响应判断自己是否被记录；
+* 独立限流：同一 IP 每分钟最多 5 条捕获，防止扫描器刷爆 KV 写配额（免费版
+  每天 1000 次写）。取不到来源 IP 时（生产环境不会发生，CF 必注入
+  `CF-Connecting-IP`）用随机后缀分桶，而不是把所有匿名来源塞进同一个桶——
+  否则一个扫描器就能把全站的捕获额度占满；
+* 事件带 `"source":"room"` 和 `"reason"`，与诱饵页的事件（无 `source` 字段）
+  区分开，导出工具可分别统计；
+* 事件结构复用诱饵页那套：时间、IP、UA、请求头白名单（**不含 cookie**）、
+  CF ray/colo/国家/ASN。30 天过期。
+
+**良性 vs 恶意的分界线**（这条最容易搞错）：端口 `0` 或 `65536` 是**良性**
+——输入框被清空、手滑多打一位，真人会犯；只有端口**不是数字**（字符串、对象）
+才算恶意，因为启动器永远发整数。第一版把端口越界也当恶意，实测立刻误捕获了
+一条真实用户式的请求，已修正。同理，房号长度不对、含 `I/O/0/1`、小写、为空、
+查询不存在的房号、非法 JSON——全部良性，不记录。
+
+导出时按来源分开看：
+
+```bash
+# 必须在带 HP 绑定的目录下运行（private-site/），否则 wrangler 找不到
+# namespace 会报 "No KV namespaces are configured"
+cd private-site
+node ../tools/honeypot-export.mjs --stats-only
+#   by source: decoy=2 room=6
+#   by reason: injection_chars=2 non_numeric_port=2 bad_method=1 control_chars=1
+
+node ../tools/honeypot-export.mjs --source room --out room-hits.ndjson
+node ../tools/honeypot-export.mjs --reason injection_chars --stats-only
+```
+
 ## 蜜罐（私有部署，不在公开仓库）
 
 蜜罐由两部分组成，**两部分都不在公开仓库里**：
