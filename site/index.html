@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LightFoxLauncher — 零依赖 Rust Minecraft 启动器</title>
-  <meta name="description" content="LightFoxLauncher 是一个零依赖的原生 Win32 Minecraft 启动器：纯 Rust 手写 JSON/ZIP/DEFLATE/SHA-1/HTTP，单文件小于 1 MB，离线单机，无登录无认证，无遥测，MPL-2.0 开源。">
+  <title>LightFoxLauncher — 零依赖 Rust Minecraft 启动器（含联机）</title>
+  <meta name="description" content="LightFoxLauncher 是一个零依赖的原生 Win32 Minecraft 启动器：纯 Rust 手写 JSON/ZIP/DEFLATE/SHA-1/HTTP，单文件小于 1 MB，离线单机与 IPv6/IPv4 直连联机，无登录无认证，无遥测，MPL-2.0 开源。">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header class="hero">
     <div class="container">
       <h1>LightFoxLauncher</h1>
-      <p class="tagline">零依赖 · 原生 Win32 · 单文件 &lt;1 MB</p>
-      <p class="sub">用纯 Rust 手写的 Minecraft 启动器：不引第三方库，不登录，不上报，一个 exe 放进文件夹就能用。</p>
+      <p class="tagline">零依赖 · 原生 Win32 · 单文件 &lt;1 MB · 自带联机</p>
+      <p class="sub">用纯 Rust 手写的 Minecraft 启动器：不引第三方库，不登录，不上报，一个 exe 放进文件夹就能用。0.4.1 起内置联机，和朋友直连开服无需中央服务器。</p>
       <p class="cta">
         <a class="btn" href="https://github.com/shouzugzs/LightFoxLauncher/releases">前往 Releases 下载</a>
         <a class="btn btn-ghost" href="#notify">配置通知</a>
@@ -33,8 +33,12 @@
           <p>直接调用 Win32 API 绘制界面，不打包浏览器内核，不依赖运行时，内存占用极低，启动瞬间完成。</p>
         </article>
         <article class="card">
-          <h3>离线单机</h3>
-          <p>无登录、无认证、无账号体系。只为离线单机设计，填个用户名就能进世界。</p>
+          <h3>联机（和朋友一起玩）</h3>
+          <p>0.4.1 新增：开服自动加防火墙规则并尝试端口映射（UPnP 失败回落 NAT-PMP）。IPv6 直连优先，即便在 CGNAT / 对称 NAT 下也能直连。6 位房间号代替 39 位 IPv6 地址，10 分钟有效，无需读出一长串数字。</p>
+        </article>
+        <article class="card">
+          <h3>离线单机与直连</h3>
+          <p>无登录、无认证、无账号体系：不接入任何 Mojang / 微软账号，离线模式即可进服；联机也是点对点直连，不经过任何中央服务器。</p>
         </article>
         <article class="card">
           <h3>MPL-2.0 开源</h3>
@@ -47,16 +51,27 @@
       </div>
     </section>
 
+    <section id="play" aria-labelledby="play-h">
+      <h2 id="play-h">联机怎么用</h2>
+      <ol>
+        <li>在启动器「联机」页点 <strong>检测网络</strong>，它会只读地告诉你本机有哪些可托管地址（公网 IPv6、IPv4 网关、防火墙规则是否已存在），不会改动任何设置。</li>
+        <li>点 <strong>开服</strong>：启动器先加一条入站防火墙规则，再尝试把端口映射出去（UPnP IGD 优先，找不到网关才回落 NAT-PMP）。</li>
+        <li>点 <strong>建房号</strong> 生成一个 6 位房间号（避开 I/0/1 等易混字符），朋友在「用房间号连接」里输入即可，10 分钟内有效。</li>
+        <li>IPv6 直连优先：只要本机有公网 IPv6，就推荐直接公布 IPv6 地址，绕开 NAT 与随机外网端口，CGNAT 网络下也能联机。</li>
+      </ol>
+      <p class="muted">说明：启动器仅支持离线模式，开服会把服务器暴露给知道地址的人；生成的服务端配置已默认开启白名单，请只把地址发给朋友。</p>
+    </section>
+
     <section id="download" aria-labelledby="download-h">
       <h2 id="download-h">下载</h2>
-      <p>当前版本：<strong>0.3.2</strong>。所有版本请见 <a href="https://github.com/shouzugzs/LightFoxLauncher/releases">GitHub Releases 页</a>。</p>
+      <p>当前版本：<strong>0.4.1</strong>（含联机）。所有版本请见 <a href="https://github.com/shouzugzs/LightFoxLauncher/releases">GitHub Releases 页</a>。</p>
       <table>
         <thead>
           <tr><th>文件</th><th>说明</th></tr>
         </thead>
         <tbody>
           <tr><td><code>LFL.exe</code></td><td>命令行版本，脚本与自动化友好</td></tr>
-          <tr><td><code>LFL-gui.exe</code></td><td>图形界面版本，原生 Win32 窗口</td></tr>
+          <tr><td><code>LFL-gui.exe</code></td><td>图形界面版本，原生 Win32 窗口（含联机页）</td></tr>
         </tbody>
       </table>
     </section>
