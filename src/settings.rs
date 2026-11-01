@@ -256,21 +256,53 @@ impl Settings {
 /// command line (the player name becomes `--username`). A hand-edited ini with
 /// a control character in `user` used to pass straight through to the JVM.
 ///
-/// On invalid values the defaults are applied instead of the file's, and the
-/// file is left untouched — the next successful save from the 设置 page rewrites
-/// it with valid content.
+/// On invalid values the offending fields are replaced with their defaults and
+/// the rest of the file is kept. Falling back to `Settings::default()`
+/// wholesale — which this used to do — meant one bad field (a stray character
+/// in `user`) also discarded `feed_url`, `room_server`, the Java path and every
+/// other preference, silently and without a way to tell which was at fault.
 pub fn load_and_apply(dir: &Path) -> Settings {
-    let s = Settings::load(dir);
-    match s.validate() {
-        Ok(()) => {}
-        Err(e) => {
-            crate::util::info(&format!(
-                "settings: ignoring invalid value(s) ({e}); using defaults for this run"
-            ));
-            let d = Settings::default();
-            d.apply();
-            return d;
+    let mut s = Settings::load(dir);
+    // Per-field repair, so a single bad value costs only that value.
+    let mut problems: Vec<String> = Vec::new();
+    if let Err(e) = crate::launcher::validate_memory(&s.memory) {
+        problems.push(format!("memory: {e}"));
+        s.memory = Settings::default().memory;
+    }
+    if let Err(e) = crate::launcher::validate_instance_name(&s.instance) {
+        problems.push(format!("instance: {e}"));
+        s.instance = Settings::default().instance;
+    }
+    if s.user.is_empty() || s.user.len() > 16 || s.user.chars().any(|c| c.is_control()) {
+        problems.push("user: must be 1..=16 characters, no control characters".to_string());
+        s.user = Settings::default().user;
+    }
+    if s.workers > crate::net::MAX_WORKERS_LIMIT {
+        problems.push(format!(
+            "workers: must be at most {}",
+            crate::net::MAX_WORKERS_LIMIT
+        ));
+        s.workers = Settings::default().workers;
+    }
+    if let Some(u) = &s.feed_url {
+        let lower = u.trim().to_ascii_lowercase();
+        if !lower.is_empty() && !lower.starts_with("https://") && !lower.starts_with("http://") {
+            problems.push("feed_url: must start with https:// or http://".to_string());
+            s.feed_url = None;
         }
+    }
+    if let Some(u) = &s.room_server {
+        let lower = u.trim().to_ascii_lowercase();
+        if !lower.is_empty() && !lower.starts_with("https://") && !lower.starts_with("http://") {
+            problems.push("room_server: must start with https:// or http://".to_string());
+            s.room_server = None;
+        }
+    }
+    if !problems.is_empty() {
+        crate::util::info(&format!(
+            "settings: replaced invalid value(s) with defaults ({}); the rest of the file was kept",
+            problems.join("; ")
+        ));
     }
     s.apply();
     s
@@ -357,6 +389,61 @@ mod tests {
         assert!(!s.feed_prompted, "missing key, no URL -> unasked");
         assert_eq!(s.user, "Alex");
         assert_eq!(s.feed_url, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_bad_field_does_not_discard_the_rest() {
+        // The old behaviour replaced the whole file with defaults when any
+        // single value failed validation, so a stray character in `user` also
+        // threw away the feed URL, the room server and every other preference
+        // — silently, with no indication of which field was at fault.
+        let dir = temp("onebad");
+        std::fs::write(
+            Settings::file(&dir),
+            "user=Bad\u{7f}Name\n\
+             feed_url=https://example.invalid/feed.json\n\
+             room_server=https://rooms.example\n\
+             workers=8\n\
+             memory=4G\n\
+             instance=pvp\n",
+        )
+        .unwrap();
+        let s = load_and_apply(&dir);
+        // The bad field fell back...
+        assert_eq!(s.user, Settings::default().user, "bad user replaced");
+        // ...and everything else survived.
+        assert_eq!(
+            s.feed_url.as_deref(),
+            Some("https://example.invalid/feed.json"),
+            "feed URL must survive an unrelated bad field"
+        );
+        assert_eq!(
+            s.room_server.as_deref(),
+            Some("https://rooms.example"),
+            "room server must survive an unrelated bad field"
+        );
+        assert_eq!(s.workers, 8);
+        assert_eq!(s.memory, "4G");
+        assert_eq!(s.instance, "pvp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_room_server_is_dropped_without_touching_the_feed() {
+        let dir = temp("badroom");
+        std::fs::write(
+            Settings::file(&dir),
+            "room_server=ftp://nope\nfeed_url=https://example.invalid/f.json\n",
+        )
+        .unwrap();
+        let s = load_and_apply(&dir);
+        assert_eq!(s.room_server, None, "non-http room server dropped");
+        assert_eq!(
+            s.feed_url.as_deref(),
+            Some("https://example.invalid/f.json"),
+            "the feed is unrelated and must be kept"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -153,6 +153,7 @@ const ID_HOST_ROOM: i32 = 760;
 const ID_HOST_ROOM_NEW: i32 = 761;
 const ID_HOST_ROOM_JOIN: i32 = 762;
 const ID_HOST_ROOM_COPY: i32 = 763;
+const ID_HOST_SERVER: i32 = 764;
 
 const TIMER_UI: usize = 1;
 const WM_APP_LOG: UINT = WM_APP + 1;
@@ -323,6 +324,8 @@ struct App {
     host_room_new: HWND,
     host_room_join: HWND,
     host_room_copy: HWND,
+    /// Room-registry address override. Empty = use the built-in default.
+    host_server: HWND,
     host_port: HWND,
     host_status: HWND,
     host_info: HWND,
@@ -510,6 +513,7 @@ impl App {
             host_room_new: std::ptr::null_mut(),
             host_room_join: std::ptr::null_mut(),
             host_room_copy: std::ptr::null_mut(),
+            host_server: std::ptr::null_mut(),
             host_port: std::ptr::null_mut(),
             host_status: std::ptr::null_mut(),
             host_info: std::ptr::null_mut(),
@@ -1255,10 +1259,21 @@ fn show_tab(app: &mut App, tab: usize) {
                 let seed = "1. 点“检测网络”查看本机联机条件（IPv6 地址 / IPv4 网关 / 防火墙）。\r\n\
                             2. 点“开服（映射端口）”配置防火墙并尝试 UPnP/NAT-PMP 映射。\r\n\
                             3. 把“复制地址”得到的地址发给朋友，朋友在多人游戏里直连。\r\n\r\n\
+                            房号联机：房主点“建房号”得到一个 6 位房号，朋友在同一页输入房号\r\n\
+                            点“用房间号连接”即可，不必手动抄 IPv6 地址。\r\n\
+                            右侧输入框可填自建房间服务器地址，留空则用默认地址。\r\n\r\n\
                             说明：本启动器为离线模式，开放联机请务必配合白名单使用；\r\n\
                             IPv6 直连需要双方都有 IPv6；运营商大内网（CGNAT）下 IPv4 映射不可用。";
                 let w = wide(seed);
                 SetWindowTextW(app.host_info, w.as_ptr());
+            }
+            // Seed the registry box from the persisted value once, so the user
+            // sees what is actually in effect rather than an empty field that
+            // silently means "the default".
+            if window_text(app.host_server).trim().is_empty() {
+                let saved = app.settings.room_server.clone().unwrap_or_default();
+                let w = wide(&saved);
+                SetWindowTextW(app.host_server, w.as_ptr());
             }
         }
     }
@@ -1832,6 +1847,16 @@ fn build_host_page(app: &mut App) {
         app.host_room_new = child(app.hwnd, "BUTTON", "建房号", WS_TABSTOP, ID_HOST_ROOM_NEW, 0);
         app.host_room_join = child(app.hwnd, "BUTTON", "用房间号连接", WS_TABSTOP, ID_HOST_ROOM_JOIN, 0);
         app.host_room_copy = child(app.hwnd, "BUTTON", "复制房号", WS_TABSTOP, ID_HOST_ROOM_COPY, 0);
+        // Room registry override. Empty means the built-in default, which the
+        // placeholder text states so the user is not left guessing.
+        app.host_server = child(
+            app.hwnd,
+            "EDIT",
+            "",
+            WS_TABSTOP | ES_AUTOHSCROLL,
+            ID_HOST_SERVER,
+            WS_EX_CLIENTEDGE,
+        );
         app.host_info = child(
             app.hwnd,
             "EDIT",
@@ -1852,6 +1877,7 @@ fn build_host_page(app: &mut App) {
             app.host_room_new,
             app.host_room_join,
             app.host_room_copy,
+            app.host_server,
             app.host_info,
         ];
         for h in &app.host_ctl {
@@ -2158,8 +2184,18 @@ fn host_copy_addr(app: &App) {
 
 // ---- room codes -----------------------------------------------------------
 
-/// The room server to use: the settings value, or the built-in default.
+/// The room server to use: the box on the page, then settings, then the
+/// built-in default.
+///
+/// The box is the source of truth while the page is open, so a user who types a
+/// self-hosted registry gets it used immediately without having to find the ini
+/// file. An empty box falls back to the persisted value, then to the default.
 fn room_server(app: &App) -> String {
+    let typed = window_text(app.host_server);
+    let typed = typed.trim();
+    if !typed.is_empty() {
+        return typed.to_string();
+    }
     app.settings
         .room_server
         .clone()
@@ -2180,6 +2216,18 @@ fn host_room_new(app: &mut App) {
     };
     let code = lightfox::room::RoomCode::generate();
     let server = room_server(app);
+    // Persist a server address the user typed, so the next start uses the same
+    // registry. Only a change is written — an unchanged page must not rewrite
+    // the settings file on every 建房号 click.
+    let typed = window_text(app.host_server);
+    let typed = typed.trim();
+    if !typed.is_empty() && app.settings.room_server.as_deref() != Some(typed) {
+        let mut s = app.settings.clone();
+        s.room_server = Some(typed.to_string());
+        if s.save(&notify_dir(app)).is_ok() {
+            app.settings = s;
+        }
+    }
     // Show the code immediately so it can be read out even if registration
     // fails; the status line says whether it is live.
     unsafe {
@@ -2804,6 +2852,8 @@ fn layout(app: &App) {
                 MoveWindow(app.host_room_join, cx + 98, b2, 130, ROW_H, 1);
                 MoveWindow(app.host_room_copy, cx + 236, b2, 90, ROW_H, 1);
                 MoveWindow(app.host_room, cx + 334, b2, 140, ROW_H, 1);
+                // Room registry override, on the same row as the code it serves.
+                MoveWindow(app.host_server, cx + 482, b2, cw_in - 482, ROW_H, 1);
                 let card_bottom = card_end(top, 3, true);
 
                 let lt = card_bottom + CARD_PAD;
