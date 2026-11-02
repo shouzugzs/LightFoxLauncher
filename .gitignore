@@ -9,10 +9,11 @@
 
 # Local scratch
 *.log
-# PNGs are build artifacts of the intro video (intro/build.js renders them);
-# the intro source slides are committed explicitly below.
 *.png
-!intro/**/*.png
+
+# Intro video pipeline: local-only material (generated media, ~14 MB),
+# never published to the repository.
+/intro/
 
 # Private honeypot deployment: never published to the public repository
 /private-site/
