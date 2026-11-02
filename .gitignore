@@ -9,7 +9,10 @@
 
 # Local scratch
 *.log
+# PNGs are build artifacts of the intro video (intro/build.js renders them);
+# the intro source slides are committed explicitly below.
 *.png
+!intro/**/*.png
 
 # Private honeypot deployment: never published to the public repository
 /private-site/
