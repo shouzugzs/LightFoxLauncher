@@ -1,12 +1,19 @@
 {
-  "latest": "0.4.2",
+  "latest": "0.4.3",
   "url": "https://github.com/shouzugzs/LightFoxLauncher/releases",
   "notes": [
+    {
+      "id": "2026-11-02-043",
+      "date": "2026-11-02",
+      "title": "0.4.3 发布：通知页可回看",
+      "body": "修复「通知」页旧公告看不了、正文挤成一行的问题。三处原因：\n\n- 缓存写进默认数据目录，读取却用「启动」页里填的目录，改过目录就永远读不到；\n- 公告正文的换行是 JSON 的转义写法，而 Win32 多行文本框只认同 Windows 的换行，两者对不上；\n- 通知服务器上的 feed.json 把换行多转义了一层，显示出来是字面的反斜杠加字母。\n\n现在即使断网或检查失败，通知页也会显示上次成功拉取的公告，正文按段落正常换行。\n\n联机：0.4.2 修好的「检测网络」本版一并包含（Family 参数类型、DAD 地址状态常量、SOCKET_ADDRESS 布局三个 FFI 错误）。\n\n下载请见发布页。",
+      "level": "update"
+    },
     {
       "id": "2026-11-02-042",
       "date": "2026-11-02",
       "title": "0.4.2 发布：联机检测修复",
-      "body": "修复「联机」页「检测网络」永远为空的 Bug。三个叠加的 FFI 错误：\n\n- GetAdaptersAddresses 的 Family 参数声明成了 u16（原型是 ULONG），x64 下寄存器高半部分是垃圾值，API 恒返回 87；\n- DAD_STATE_PREFERRED 常量写成了 1（那是 Tentative），真实地址全部报 4，过滤器拒绝了所有地址；\n- SOCKET_ADDRESS 多写了一个不存在的 family 成员，导致后面字段偏移全部错位。\n\n现在检测网络会列出可用于开服的 IPv6/IPv4 地址与网关。\n\n另外：通知页在检查失败或离线时显示上次缓存的公告，旧公告随时可以回看。\n\n下载请见发布页。",
+      "body": "修复「联机」页「检测网络」永远为空的 Bug。三个叠加的 FFI 错误：\n\n- GetAdaptersAddresses 的 Family 参数声明成了 u16（原型是 ULONG），x64 下寄存器高半部分是垃圾值，API 恒返回 87；\n- DAD_STATE_PREFERRED 常量写成了 1（那是 Tentative），真实地址全部报 4，过滤器拒绝了所有地址；\n- SOCKET_ADDRESS 多写了一个不存在的 family 成员，导致后面字段偏移全部错位。\n\n现在检测网络会列出可用于开服的 IPv6/IPv4 地址与网关。\n\n下载请见发布页。",
       "level": "update"
     },
     {

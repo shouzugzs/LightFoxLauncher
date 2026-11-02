@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.3
+
+### Fixed
+
+* 通知页「回看不了」的三处原因：
+  - 缓存写进 `util::default_dir()`，读取却用「启动」页的数据目录，改过目录的
+    用户永远读不到自己的缓存 —— 现在写入与读取用同一目录（`notify::fetch_into`）；
+  - 正文换行是 JSON 的 `\n`，而 Win32 多行 `EDIT` 只在 `\r\n` 处换行，整段正文
+    被画成一行 —— 显示前用 `notify::edit_text` 转换；
+  - `site/feed.json` 的换行曾写成 `\\n`（双重转义），解析出来是字面的反斜杠加
+    n，现在修正，并由 `the_shipped_feed_json_parses` 守住这个格式。
+
 ## 0.4.2
 
 ### Fixed
@@ -12,13 +24,6 @@
     入站仍然可达；
   - `SOCKET_ADDRESS` 没有 family 成员（多写的字段把后面字段全部偏移搞错）；
     `FirstGatewayAddress` 在当前 Windows 位于 +232 且指向内联 sockaddr，实测确认。
-* 通知页「回看不了」的三处原因：
-  - 缓存写进 `util::default_dir()`，读取却用「启动」页的数据目录，改过目录的
-    用户永远读不到自己的缓存 —— 现在写入与读取用同一目录（`notify::fetch_into`）；
-  - 正文换行是 JSON 的 `\n`，而 Win32 多行 `EDIT` 只在 `\r\n` 处换行，整段正文
-    被画成一行 —— 显示前用 `notify::edit_text` 转换；
-  - `site/feed.json` 的换行曾写成 `\\n`（双重转义），解析出来是字面的反斜杠加
-    n，现在修正，并由 `the_shipped_feed_json_parses` 守住这个格式。
 
 ## 0.4.1
 
