@@ -5616,8 +5616,9 @@ fn notify_fetch(app: &mut App, url: String, quiet: bool) {
     app.feed_started = Some(std::time::Instant::now());
     let q = app.feed_q.clone();
     let hwnd_val = app.hwnd as usize;
+    let dir = notify_dir(app);
     std::thread::spawn(move || {
-        let res = lightfox::notify::fetch(&url);
+        let res = lightfox::notify::fetch_into(&url, &dir);
         if let Ok(mut g) = q.lock() {
             *g = Some(res);
         }
@@ -5775,7 +5776,9 @@ fn notify_selection_changed(app: &mut App) {
                     text.push_str(&format!("   （{}）", n.date));
                 }
                 text.push_str("\r\n\r\n");
-                text.push_str(&n.body);
+                // A classic EDIT control only starts a new line on \r\n; a feed
+                // body carries the JSON \n escape, so it is re-wrapped here.
+                text.push_str(&lightfox::notify::edit_text(&n.body));
                 if let Some(u) = &feed.url {
                     text.push_str("\r\n\r\n下载页：");
                     text.push_str(u);

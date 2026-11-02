@@ -471,6 +471,10 @@ const CACHE_FILE: &str = "lfl-feed-cache.json";
 /// fetch. The text is the already size-capped body, so the cache cannot grow
 /// beyond [`MAX_BODY`].
 pub fn save_cache(dir: &Path, text: &str) {
+    // The directory normally exists (the settings file lives there), but a fresh
+    // `--dir` target may not: creating it is cheap and keeps a first run from
+    // silently skipping the cache.
+    let _ = crate::util::mkdirs(dir);
     let _ = std::fs::write(dir.join(CACHE_FILE), text);
 }
 
@@ -486,19 +490,52 @@ pub fn load_cache(dir: &Path) -> Option<Feed> {
     parse(&text).ok()
 }
 
-/// Fetch and parse the feed at `url`.
+/// Re-wrap a feed body for a Win32 multiline `EDIT` control.
 ///
-/// One request, no retry: this runs on a worker thread while the user waits, and
-/// a broken announcement endpoint must never make the launcher feel slow. A
-/// failure is reported as an error string, and the caller keeps the previous
-/// state.
+/// A classic `EDIT` with `ES_MULTILINE` starts a new line only on `\r\n`; a
+/// lone `\n` is drawn as a box or dropped, so a body that uses the normal JSON
+/// `\n` escape would arrive as one run-on paragraph. Feed bodies are normalised
+/// here instead of asking every publisher to write `\r\n` by hand.
 ///
-/// A successful fetch is also written to the local cache file, so the 通知 page
-/// can show the notes again after a restart (or offline) instead of starting
-/// blank until the next successful check. Writing the cache here — the one
-/// place that has both the text and proof that it parsed — keeps the GUI free
-/// of cache plumbing.
-pub fn fetch(url: &str) -> Res<Feed> {
+/// `\r\n` is left exactly as it is, so text that is already Windows-shaped does
+/// not gain a stray `\r`.
+pub fn edit_text(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 16);
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                out.push('\r');
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                    out.push('\n');
+                }
+            }
+            '\n' => out.push_str("\r\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Fetch, parse, then cache the document in `dir`.
+///
+/// The cache path is a parameter rather than [`crate::util::default_dir`] because
+/// the 通知 page resolves its state directory from the 启动 page's data dir: a
+/// user who picked a custom directory would otherwise write the cache to one
+/// place and read it from another, and the review feature would silently never
+/// work for them.
+pub fn fetch_into(url: &str, dir: &Path) -> Res<Feed> {
+    let text = fetch_text(url)?;
+    let feed = parse(&text)?;
+    // Only a fully parsed document is cached, so a publisher cannot poison the
+    // offline copy with a payload the parser would reject on reload anyway.
+    save_cache(dir, &text);
+    Ok(feed)
+}
+
+/// Fetch the document at `url` and return its text, without parsing it.
+fn fetch_text(url: &str) -> Res<String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("未配置通知地址".to_string());
@@ -528,10 +565,16 @@ pub fn fetch(url: &str) -> Res<Feed> {
     // refused the document after the launcher had already buffered all of it —
     // a hostile endpoint could push a gigabyte into memory first.
     let body = crate::net::get_max(url, MAX_BODY).map_err(|e| format!("拉取通知失败：{e}"))?;
-    let text = String::from_utf8_lossy(&body);
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Fetch and parse the feed at `url`, caching it in the default data directory.
+///
+/// Kept for callers (and tests) that have no page state to consult; the GUI uses
+/// [`fetch_into`] so the cache lands in the directory the user actually chose.
+pub fn fetch(url: &str) -> Res<Feed> {
+    let text = fetch_text(url)?;
     let feed = parse(&text)?;
-    // Only a fully parsed document is cached, so a publisher cannot poison the
-    // offline copy with a payload the parser would reject on reload anyway.
     save_cache(&crate::util::default_dir(), &text);
     Ok(feed)
 }
@@ -843,6 +886,15 @@ mod tests {
             assert!(!n.id.is_empty(), "note id must not be empty");
             assert!(!n.title.is_empty(), "note title must not be empty");
             assert!(n.body.chars().count() <= MAX_FIELD, "note body too long");
+            // The body is prose for the 通知 page. Hand-editing this file used to
+            // double-escape the line break ("\\\\n" in JSON), which the parser
+            // faithfully turns into a literal backslash-n and the UI then shows
+            // as two visible characters instead of a paragraph break.
+            assert!(
+                !n.body.contains("\\n"),
+                "note {:?} contains a literal backslash-n; write \\n, not \\\\n",
+                n.id
+            );
         }
         if let Some(v) = &feed.latest {
             assert!(
@@ -904,8 +956,24 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_body_is_refused_with_a_clear_message() {
-        // The cap is now passed into the fetch, so the error text comes from
+    fn edit_text_wraps_bodies_for_a_win32_edit_control() {
+        // A classic EDIT control breaks lines only on \r\n, so the JSON \n
+        // escape has to be converted — otherwise the whole body renders as one
+        // paragraph (or with box glyphs) instead of the publisher's layout.
+        assert_eq!(edit_text("a\nb"), "a\r\nb");
+        assert_eq!(edit_text("a\r\nb"), "a\r\nb", "already-correct input is untouched");
+        assert_eq!(edit_text("a\rb"), "a\rb", "a lone CR is not doubled");
+        assert_eq!(edit_text(""), "");
+        // Mixed input must not produce \r\r\n.
+        assert_eq!(edit_text("x\n\r\ny"), "x\r\n\r\ny");
+        // The parser keeps \n in bodies; the edit control needs the wrapped form.
+        let f = parse(r#"{"notes":[{"id":"a","title":"t","body":"l1\nl2"}]}"#).unwrap();
+        assert!(f.notes[0].body.contains('\n'));
+        assert!(edit_text(&f.notes[0].body).contains("\r\n"));
+    }
+
+    #[test]
+    fn a_huge_body_is_refused_with_a_clear_message() {        // The cap is now passed into the fetch, so the error text comes from
         // net.rs. Assert the constant the caller matches on is present, so a
         // wording change cannot silently break the message.
         assert!(crate::net::TOO_LARGE.contains("size cap"));

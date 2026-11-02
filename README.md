@@ -15,7 +15,7 @@ no login server, no runtime dependencies — just the game.
 
 | Binary | Size | What it is |
 |---|---|---|
-| `LFL-gui.exe` | **739,328 B (0.70 MiB)** | native Win32 window: pick version, click play |
+| `LFL-gui.exe` | **741,376 B (0.71 MiB)** | native Win32 window: pick version, click play |
 | `LFL.exe` | **526,848 B (0.50 MiB)** | command line, scriptable |
 
 ```
@@ -567,6 +567,11 @@ Behaviour:
   retry — a broken endpoint must not make the launcher feel slow.
 - **Read state persists** in `<data dir>/lfl-seen.ini`: unread notes get a `•`,
   and 全部已读 clears them. The file is capped at 200 ids.
+- **Old announcements stay reviewable.** Every successful fetch is also cached in
+  `<data dir>/lfl-feed-cache.json`, so the page shows the last known notes after
+  a restart, or when the endpoint is unreachable.
+- Bodies are ordinary JSON strings, so write a line break as `\n` (**not**
+  `\\n`). The launcher converts it to the `\r\n` a Win32 edit control needs.
 - **A new launcher version is reported once.** The version already announced is
   remembered, so you are not told about `0.3.0` on every start.
 - The launcher **never downloads or replaces its own executable.** You get a

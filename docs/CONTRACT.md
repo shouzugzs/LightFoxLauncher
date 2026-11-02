@@ -136,7 +136,9 @@ pub struct Feed { pub latest: Option<String>, pub url: Option<String>,
 
 pub fn is_newer(candidate: &str, current: &str) -> bool;  // numeric, not lexical
 pub fn parse(text: &str) -> Res<Feed>;
-pub fn fetch(url: &str) -> Res<Feed>;
+pub fn edit_text(body: &str) -> String;   // \n -> \r\n for a Win32 EDIT control
+pub fn fetch(url: &str) -> Res<Feed>;     // caches in util::default_dir()
+pub fn fetch_into(url: &str, dir: &Path) -> Res<Feed>;  // caches in <dir>
 pub fn now_secs() -> u64;
 
 pub struct Seen { pub ids: Vec<String>, pub last_check: u64,
@@ -165,6 +167,13 @@ Rules that must not regress:
 4. **An empty feed is valid.** `{}` means "no announcements", not an error.
 5. **`Seen.ids` is bounded** at 200, oldest dropped. `save` writes oldest-first so
    a reload restores the same order.
+6. **The cache is written where the GUI reads it.** The 通知 page resolves its
+   state directory from the 启动 page's data dir, so the write must use
+   `fetch_into(url, dir)`; `fetch` keeps the old default-dir behaviour only for
+   callers that have no page state.
+7. **Bodies go through `edit_text` before reaching an EDIT control.** A classic
+   multi-line `EDIT` breaks only on `\r\n`, so a raw `\n` from the feed would
+   render the whole note as one line.
 
 ## Ownership map (disjoint write scopes)
 
