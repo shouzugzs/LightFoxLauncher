@@ -185,17 +185,29 @@ pub const BM_GETCHECK: UINT = 0x00F0;
 pub const BM_SETCHECK: UINT = 0x00F1;
 
 pub const LB_ADDSTRING: UINT = 0x0180;
+pub const LB_GETCOUNT: UINT = 0x018B;
 pub const LB_RESETCONTENT: UINT = 0x0184;
 pub const LB_SETCURSEL: UINT = 0x0186;
 pub const LB_GETCURSEL: UINT = 0x0188;
 pub const LB_GETTEXT: UINT = 0x0189;
 pub const LB_GETTEXTLEN: UINT = 0x018A;
 pub const LB_ERR: isize = -1;
+/// Notification codes the list box sends its parent through `WM_COMMAND`.
+///
+/// **`LBS_NOTIFY` is what enables them at all.** Without it a list box still
+/// tracks the selection (`LB_GETCURSEL` answers correctly) but never tells the
+/// parent, so a page wired to `LBN_SELCHANGE` looks alive and does nothing —
+/// which is exactly how 通知 lost its click-to-review behaviour.
 pub const LBN_SELCHANGE: u16 = 1;
+pub const LBN_DBLCLK: u16 = 2;
+pub const LBS_NOTIFY: DWORD = 0x0001;
 pub const BS_AUTOCHECKBOX: DWORD = 0x0003;
 /// Owner-drawn: the parent paints it via `WM_DRAWITEM`.
 pub const BS_OWNERDRAW: DWORD = 0x000B;
 pub const LBS_NOINTEGRALHEIGHT: DWORD = 0x0000_0100;
+/// Draws a border around a list box; `LBS_NOTIFY | LBS_NOINTEGRALHEIGHT` is
+/// otherwise the default style, so this is the only extra bit a plain list needs.
+pub const LBS_STANDARD: DWORD = LBS_NOTIFY | 0x0020_0000 | WS_BORDER;
 
 /// `GWL_STYLE`, read to add `BS_OWNERDRAW` to a button's existing style.
 pub const GWL_STYLE: i32 = -16;

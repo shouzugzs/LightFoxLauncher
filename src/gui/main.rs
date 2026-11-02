@@ -1458,7 +1458,7 @@ fn build_settings_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | 0x0020_0000,
+            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY,
             ID_JAVA_LIST,
             0,
         );
@@ -1614,7 +1614,7 @@ fn build_mods_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | 0x0020_0000 | 0x0100,
+            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_MOD_LIST,
             0,
         );
@@ -1688,7 +1688,7 @@ fn build_search_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | 0x0020_0000 | 0x0100,
+            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_SRCH_LIST,
             0,
         );
@@ -1722,7 +1722,7 @@ fn build_version_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | 0x0020_0000 | 0x0100,
+            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_VER_MODLIST,
             0,
         );
@@ -1733,7 +1733,7 @@ fn build_version_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | 0x0020_0000 | 0x0100,
+            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_VER_LIST,
             0,
         );
@@ -1781,7 +1781,7 @@ fn build_notify_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | 0x0020_0000 | 0x0100,
+            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_NOTIFY_LIST,
             0,
         );

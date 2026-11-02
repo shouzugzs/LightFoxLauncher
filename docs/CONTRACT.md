@@ -174,6 +174,11 @@ Rules that must not regress:
 7. **Bodies go through `edit_text` before reaching an EDIT control.** A classic
    multi-line `EDIT` breaks only on `\r\n`, so a raw `\n` from the feed would
    render the whole note as one line.
+8. **Every list box is created with `LBS_NOTIFY`.** Without it a list box still
+   tracks its selection (`LB_GETCURSEL` answers correctly) but never sends
+   `LBN_SELCHANGE`, so a page wired to `WM_COMMAND` looks alive and does nothing.
+   That was the 通知 click-to-review bug, and it silently affected the
+   版本 / 模组 / 搜索 lists too.
 
 ## Ownership map (disjoint write scopes)
 

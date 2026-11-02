@@ -4,7 +4,12 @@
 
 ### Fixed
 
-* 通知页「回看不了」的三处原因：
+* 通知页「点击旧公告没反应」的真正原因：所有列表框都少了 `LBS_NOTIFY` 样式。
+  列表照样记录选中项（`LB_GETCURSEL` 答得对），但从不把 `LBN_SELCHANGE` 发给
+  父窗口，于是绑定在 `WM_COMMAND` 上的 `notify_selection_changed` 永远不会跑 ——
+  正文只在刷新列表时由 `notify_rebuild_list` 填一次，之后点哪一条都不变。
+  同一个缺陷也影响 版本 / 模组 / 搜索 页的列表。
+* 通知页「回看不了」的另外三处原因：
   - 缓存写进 `util::default_dir()`，读取却用「启动」页的数据目录，改过目录的
     用户永远读不到自己的缓存 —— 现在写入与读取用同一目录（`notify::fetch_into`）；
   - 正文换行是 JSON 的 `\n`，而 Win32 多行 `EDIT` 只在 `\r\n` 处换行，整段正文
