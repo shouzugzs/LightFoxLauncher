@@ -15,6 +15,14 @@
 //! * what is the default **IPv4 gateway** (the target for UPnP discovery);
 //! * what **local IPv4** address would the game bind to.
 //!
+//! The Win32 structs below mirror the SDK layouts exactly, including the
+//! fields this code never reads. That is not pedantry: an earlier version
+//! omitted `FirstAnycastAddress`, `FirstMulticastAddress`, `ZoneIndices`,
+//! `FirstPrefix` and the link-speed fields and inlined the `SOCKADDR`, so
+//! every field after `FirstUnicastAddress` was read from the wrong offset and
+//! 检测网络 reported "no IPv6, no gateway" on a machine that had both. The
+//! `const` size asserts at the bottom make a silent re-drift impossible.
+//!
 //! OWNER: lead.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -24,9 +32,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 const ERROR_SUCCESS: u32 = 0;
 const ERROR_BUFFER_OVERFLOW: u32 = 122;
 
+const AF_UNSPEC: u16 = 0;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 23;
-const AF_UNSPEC: u16 = 0;
 
 const GAA_FLAG_SKIP_ANYCAST: u32 = 0x0002;
 const GAA_FLAG_SKIP_MULTICAST: u32 = 0x0004;
@@ -44,19 +52,25 @@ const DAD_STATE_PREFERRED: u32 = 1;
 
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 
+/// `SOCKET_ADDRESS`: a pointer to a `SOCKADDR` plus its length and family.
+///
+/// The `SOCKADDR` itself is opaque here; the address bytes are read out of the
+/// pointed-to buffer by [`sockaddr_bytes`] using the documented layouts of
+/// `sockaddr_in` (family at 0, address at 4) and `sockaddr_in6` (family at 0,
+/// address at 8).
 #[repr(C)]
 struct SocketAddress {
-    family: u16,
-    _pad: u16,
-    port_be: u16,
-    flowinfo_be: u32,
-    addr: [u8; 16],
-    scope_id: u32,
+    lp_sockaddr: *const u8,
+    i_sockaddr_length: i32,
+    i_family: i32,
 }
 
+/// `IP_ADAPTER_UNICAST_ADDRESS_LH` (x64): 64 bytes, `Address` is a
+/// `SOCKET_ADDRESS` *pointer holder*, not an inline socket address.
 #[repr(C)]
 struct IpAdapterUnicastAddress {
-    _header: usize,
+    /// Union `Alignment` / `{Length, IfIndex}` — never read.
+    _header: u64,
     next: *const IpAdapterUnicastAddress,
     address: SocketAddress,
     prefix_origin: u32,
@@ -65,35 +79,53 @@ struct IpAdapterUnicastAddress {
     valid_lifetime: u32,
     preferred_lifetime: u32,
     lease_lifetime: u32,
-    _flags: u8,
+    flags: u8,
     skip_as_source: u8,
+    /// The LH struct ends with `ULONG Reserved`; the trailing padding is
+    /// implied, so no field is needed — the size assert proves the shape.
+    _reserved: u32,
 }
 
+/// `IP_ADAPTER_GATEWAY_ADDRESS_LH`: `Next` then one `SOCKET_ADDRESS`.
 #[repr(C)]
 struct IpAdapterGatewayAddress {
     next: *const IpAdapterGatewayAddress,
     address: SocketAddress,
 }
 
+/// `IP_ADAPTER_ADDRESSES_LH` (x64), complete through `Ipv4IfIndex`.
+///
+/// Every field the SDK declares between `AdapterName` and `FirstGatewayAddress`
+/// is present, including the ones this code ignores. Skipping a "useless"
+/// field is exactly what broke the previous version: on x64 each skipped
+/// pointer/array shifts everything after it and the reads silently return
+/// unrelated bytes.
 #[repr(C)]
 struct IpAdapterAddresses {
-    _header: usize,
+    /// Union `Alignment` / `{Length, IfIndex}` — never read.
+    _header: u64,
     next: *const IpAdapterAddresses,
     adapter_name: *const u8,
     first_unicast: *const IpAdapterUnicastAddress,
-    first_dns_server: *const SocketAddress,
+    first_anycast: *const core::ffi::c_void,
+    first_multicast: *const core::ffi::c_void,
+    first_dns_server: *const core::ffi::c_void,
     dns_suffix: *const u16,
     description: *const u16,
     friendly_name: *const u16,
-    _mac: *const u8,
-    _physical_len: u32,
+    physical_address: [u8; 8],
+    physical_address_length: u32,
     flags: u32,
     mtu: u32,
     if_type: u32,
     oper_status: u32,
     ipv6_if_index: u32,
+    zone_indices: [u32; 16],
+    first_prefix: *const core::ffi::c_void,
+    transmit_link_speed: u64,
+    receive_link_speed: u64,
+    first_wins_server_address: *const core::ffi::c_void,
     first_gateway: *const IpAdapterGatewayAddress,
-    first_unicast_ok: *const IpAdapterUnicastAddress, // not a real field name
     ipv4_if_index: u32,
 }
 
@@ -106,6 +138,58 @@ extern "system" {
         adapter: *mut IpAdapterAddresses,
         size: *mut u32,
     ) -> u32;
+}
+
+// Layout asserts: if the SDK ever changes a size, this fails the build instead
+// of failing at the user's machine the way the silent drift did.
+const _: () = {
+    assert!(core::mem::size_of::<SocketAddress>() == 16);
+    assert!(core::mem::size_of::<IpAdapterUnicastAddress>() == 64);
+    // x64: next 8 + SOCKET_ADDRESS 16 = 24, aligned to 8. The SDK struct is
+    // `IP_ADAPTER_GATEWAY_ADDRESS_LH { Next, Address }` — 24 bytes.
+    assert!(core::mem::size_of::<IpAdapterGatewayAddress>() == 24);
+    // x64: header 8 + next 8 + name 8 + unicast 8 + anycast 8 + multicast 8
+    // + dns 8 + suffix 8 + desc 8 + friendly 8 = 80; phys 8 = 88; len/flags/
+    // mtu/iftype/oper/v6if = 24 -> 112; zone 64 -> 176; prefix 8 -> 184;
+    // tx 8 -> 192; rx 8 -> 200; wins 8 -> 208; gateway 8 -> 216; v4if 4 -> 220,
+    // padded to 224 by alignment.
+    assert!(core::mem::size_of::<IpAdapterAddresses>() == 224);
+};
+
+/// Read the family and raw address bytes out of a `SOCKADDR`.
+///
+/// Returns `(family, addr16, is_v4)`. `addr16` holds the 4 v4 bytes in
+/// `addr16[0..4]` for IPv4, or the full 16 v6 bytes for IPv6. The length is
+/// checked before anything is read, so a truncated or foreign `SOCKADDR`
+/// yields `None` instead of an out-of-bounds read.
+unsafe fn sockaddr_bytes(sa: &SocketAddress) -> Option<(u16, [u8; 16], bool)> {
+    if sa.lp_sockaddr.is_null() {
+        return None;
+    }
+    if sa.i_sockaddr_length < 4 {
+        return None;
+    }
+    let p = sa.lp_sockaddr;
+    let family = u16::from_le_bytes([*p, *p.add(1)]);
+    match family {
+        AF_INET => {
+            if sa.i_sockaddr_length < 16 {
+                return None;
+            }
+            let mut out = [0u8; 16];
+            out[..4].copy_from_slice(std::slice::from_raw_parts(p.add(4), 4));
+            Some((family, out, true))
+        }
+        AF_INET6 => {
+            if sa.i_sockaddr_length < 28 {
+                return None;
+            }
+            let mut out = [0u8; 16];
+            out.copy_from_slice(std::slice::from_raw_parts(p.add(8), 16));
+            Some((family, out, false))
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- impl
@@ -121,8 +205,13 @@ fn is_up(oper: u32) -> bool {
 /// (confirmed against the GetAdaptersAddresses docs), so global is judged by
 /// prefix: 2000::/3 is the currently-routable global unicast space; fe80::/10
 /// link-local and fc00::/7 ULA fail the check.
-fn hostable_v6(u: &IpAdapterUnicastAddress) -> bool {
-    if u.address.family != AF_INET6 || u.dad_state != DAD_STATE_PREFERRED {
+///
+/// Tunnel prefixes are rejected even though they sit inside 2000::/3: a
+/// Teredo (`2001:0::/32`) or 6to4 (`2002::/16`) address is a tunnel endpoint,
+/// not an address a friend can dial — reporting it as "可联机" sent users to
+/// share an address that could never accept a connection.
+fn hostable_v6(u: &IpAdapterUnicastAddress, bytes: &[u8; 16]) -> bool {
+    if u.dad_state != DAD_STATE_PREFERRED {
         return false;
     }
     // Temporary addresses (RFC 4941) have SuffixOrigin == Random and are
@@ -137,32 +226,46 @@ fn hostable_v6(u: &IpAdapterUnicastAddress) -> bool {
     ) {
         return false;
     }
-    let seg0 = u16::from_be_bytes([u.address.addr[0], u.address.addr[1]]);
-    // 2000::/3 covers 2000:: through 3fff::.
-    (seg0 & 0xe000) == 0x2000
+    let seg0 = u16::from_be_bytes([bytes[0], bytes[1]]);
+    if (seg0 & 0xe000) != 0x2000 {
+        return false; // not in 2000::/3: link-local, ULA, ...
+    }
+    // Teredo 2001:0::/32 and 6to4 2002::/16: tunnels, not hostable.
+    if seg0 == 0x2001 || seg0 == 0x2002 {
+        let seg1 = u16::from_be_bytes([bytes[2], bytes[3]]);
+        if seg0 == 0x2001 && seg1 == 0 {
+            return false;
+        }
+        if seg0 == 0x2002 {
+            return false;
+        }
+    }
+    true
 }
 
 fn v6_from_sockaddr(a: &SocketAddress) -> Option<Ipv6Addr> {
-    if a.family != AF_INET6 {
+    let (family, bytes, _) = unsafe { sockaddr_bytes(a)? };
+    if family != AF_INET6 {
         return None;
     }
     Some(Ipv6Addr::new(
-        u16::from_be_bytes([a.addr[0], a.addr[1]]),
-        u16::from_be_bytes([a.addr[2], a.addr[3]]),
-        u16::from_be_bytes([a.addr[4], a.addr[5]]),
-        u16::from_be_bytes([a.addr[6], a.addr[7]]),
-        u16::from_be_bytes([a.addr[8], a.addr[9]]),
-        u16::from_be_bytes([a.addr[10], a.addr[11]]),
-        u16::from_be_bytes([a.addr[12], a.addr[13]]),
-        u16::from_be_bytes([a.addr[14], a.addr[15]]),
+        u16::from_be_bytes([bytes[0], bytes[1]]),
+        u16::from_be_bytes([bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
+        u16::from_be_bytes([bytes[10], bytes[11]]),
+        u16::from_be_bytes([bytes[12], bytes[13]]),
+        u16::from_be_bytes([bytes[14], bytes[15]]),
     ))
 }
 
 fn v4_from_sockaddr(a: &SocketAddress) -> Option<Ipv4Addr> {
-    if a.family != AF_INET {
+    let (family, bytes, _) = unsafe { sockaddr_bytes(a)? };
+    if family != AF_INET {
         return None;
     }
-    Some(Ipv4Addr::new(a.addr[0], a.addr[1], a.addr[2], a.addr[3]))
+    Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
 }
 
 /// Everything found in one pass, so the UI never mixes inconsistent reads.
@@ -218,21 +321,26 @@ unsafe fn collect_adapters(flags: u32) -> HostNet {
             while !u.is_null() {
                 let ua = &*u;
                 if ua.dad_state == DAD_STATE_PREFERRED {
-                    if hostable_v6(ua) {
-                        if let Some(v6) = v6_from_sockaddr(&ua.address) {
-                            let s = v6.to_string();
-                            if !out.v6_global.contains(&s) {
-                                out.v6_global.push(s);
+                    // One normalized read of the pointed-to SOCKADDR. A
+                    // foreign family or a too-short record is skipped, not
+                    // guessed at.
+                    if let Some((family, bytes, is_v4)) = sockaddr_bytes(&ua.address) {
+                        if !is_v4 && hostable_v6(ua, &bytes) {
+                            if let Some(v6) = v6_from_sockaddr(&ua.address) {
+                                let s = v6.to_string();
+                                if !out.v6_global.contains(&s) {
+                                    out.v6_global.push(s);
+                                }
                             }
                         }
-                    }
-                    if ua.address.family == AF_INET {
-                        if let Some(v4) = v4_from_sockaddr(&ua.address) {
-                            // Skip 169.254/16 link-local: no hosting on it.
-                            if !(v4.octets()[0] == 169 && v4.octets()[1] == 254) {
-                                let s = v4.to_string();
-                                if !out.v4_local.contains(&s) {
-                                    out.v4_local.push(s);
+                        if is_v4 && family == AF_INET {
+                            if let Some(v4) = v4_from_sockaddr(&ua.address) {
+                                // Skip 169.254/16 link-local: no hosting on it.
+                                if !(v4.octets()[0] == 169 && v4.octets()[1] == 254) {
+                                    let s = v4.to_string();
+                                    if !out.v4_local.contains(&s) {
+                                        out.v4_local.push(s);
+                                    }
                                 }
                             }
                         }
@@ -244,12 +352,10 @@ unsafe fn collect_adapters(flags: u32) -> HostNet {
             let mut g = a.first_gateway;
             while !g.is_null() {
                 let ga = &*g;
-                if ga.address.family == AF_INET {
-                    if let Some(v4) = v4_from_sockaddr(&ga.address) {
-                        let s = v4.to_string();
-                        if !out.v4_gateways.contains(&s) {
-                            out.v4_gateways.push(s);
-                        }
+                if let Some(v4) = v4_from_sockaddr(&ga.address) {
+                    let s = v4.to_string();
+                    if !out.v4_gateways.contains(&s) {
+                        out.v4_gateways.push(s);
                     }
                 }
                 g = ga.next;
@@ -280,12 +386,94 @@ mod tests {
         }
         for s in &n.v6_global {
             let ip: Ipv6Addr = s.parse().expect("v6 string parses");
-            // No link-local fe80::/10 in the global list.
-            assert!(!(ip.segments()[0] & 0xffc0) == 0xfe80, "no fe80 in v6_global");
+            // No link-local fe80::/10, ULA fc00::/7, Teredo 2001:0::/32 or
+            // 6to4 2002::/16 in the global list.
+            let seg0 = ip.segments()[0];
+            assert!((seg0 & 0xffc0) != 0xfe80, "no fe80 in v6_global");
+            assert!((seg0 & 0xffc0) != 0xfc00, "no ULA in v6_global");
+            assert!(!(seg0 == 0x2001 && ip.segments()[1] == 0), "no Teredo in v6_global");
+            assert!(seg0 != 0x2002, "no 6to4 in v6_global");
+            // Everything left must be global unicast 2000::/3.
+            assert!((seg0 & 0xe000) == 0x2000, "{ip} is not global unicast");
         }
         // Gateways, when present, are valid v4.
         for s in &n.v4_gateways {
             let _: Ipv4Addr = s.parse().expect("gateway parses");
         }
+    }
+
+    #[test]
+    fn struct_layouts_match_the_sdk() {
+        // The drift that broke detection was invisible at compile time; these
+        // duplicates of the const asserts run on every `cargo test` so a
+        // regression names the exact struct.
+        assert_eq!(core::mem::size_of::<SocketAddress>(), 16);
+        assert_eq!(core::mem::size_of::<IpAdapterUnicastAddress>(), 64);
+        assert_eq!(core::mem::size_of::<IpAdapterGatewayAddress>(), 24);
+        assert_eq!(core::mem::size_of::<IpAdapterAddresses>(), 224);
+    }
+
+    #[test]
+    fn tunnel_prefixes_are_not_hostable() {
+        // Hand-built unicast entries: DAD preferred, RA origin, not random.
+        // The SOCKADDR buffer is laid out like a real sockaddr_in6: family
+        // (LE u16) at 0, address at 8.
+        fn entry(addr: [u8; 16]) -> (IpAdapterUnicastAddress, Vec<u8>) {
+            let mut sa = vec![0u8; 28];
+            sa[0] = AF_INET6 as u8;
+            sa[1] = (AF_INET6 >> 8) as u8;
+            sa[8..24].copy_from_slice(&addr);
+            let ptr = sa.as_ptr();
+            (
+                IpAdapterUnicastAddress {
+                    _header: 0,
+                    next: std::ptr::null(),
+                    address: SocketAddress {
+                        lp_sockaddr: ptr,
+                        i_sockaddr_length: 28,
+                        i_family: AF_INET6 as i32,
+                    },
+                    prefix_origin: PREFIX_ORIGIN_ROUTER_ADVERTISEMENT,
+                    suffix_origin: 2, // not RANDOM
+                    dad_state: DAD_STATE_PREFERRED,
+                    valid_lifetime: 0,
+                    preferred_lifetime: 0,
+                    lease_lifetime: 0,
+                    flags: 0,
+                    skip_as_source: 0,
+                    _reserved: 0,
+                },
+                sa,
+            )
+        }
+
+        // A real RA-issued global address is hostable.
+        let (good, _b1) = entry([
+            0x24, 0x09, 0x8a, 0x28, 0x44, 0x02, 0x3f, 0x14, 0, 0, 0, 0, 0, 0, 0x00, 0x02,
+        ]);
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&unsafe { std::slice::from_raw_parts(good.address.lp_sockaddr.add(8), 16) });
+        assert!(hostable_v6(&good, &bytes), "real global v6 must be hostable");
+
+        // Teredo 2001:0:… is not, despite living inside 2000::/3.
+        let (teredo, _b2) = entry([
+            0x20, 0x01, 0x00, 0x00, 0x14, 0xc9, 0xd5, 0x02, 0x28, 0x21, 0xe8, 0x55, 0x8a, 0x6c,
+            0xb1, 0x96,
+        ]);
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&unsafe { std::slice::from_raw_parts(teredo.address.lp_sockaddr.add(8), 16) });
+        assert!(!hostable_v6(&teredo, &bytes), "Teredo must not be reported as hostable");
+
+        // 6to4 2002::/16 is not either.
+        let (six2four, _b3) = entry([0x20, 0x02, 0xc0, 0xa8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&unsafe { std::slice::from_raw_parts(six2four.address.lp_sockaddr.add(8), 16) });
+        assert!(!hostable_v6(&six2four, &bytes), "6to4 must not be reported as hostable");
+
+        // ULA fdfd::/8 (Radmin VPN) fails the 2000::/3 test.
+        let (ula, _b4) = entry([0xfd, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&unsafe { std::slice::from_raw_parts(ula.address.lp_sockaddr.add(8), 16) });
+        assert!(!hostable_v6(&ula, &bytes), "ULA must not be reported as hostable");
     }
 }
