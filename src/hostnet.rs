@@ -46,23 +46,29 @@ const PREFIX_ORIGIN_WELL_KNOWN: u32 = 2;
 const PREFIX_ORIGIN_DHCP: u32 = 3;
 const PREFIX_ORIGIN_ROUTER_ADVERTISEMENT: u32 = 4;
 
+/// `SUFFIX_ORIGIN_RANDOM`: the address is a RFC 4941 temporary address.
 const SUFFIX_ORIGIN_RANDOM: u32 = 3;
 
-const DAD_STATE_PREFERRED: u32 = 1;
+/// `IP_DAD_STATE` ([nldef.h](https://learn.microsoft.com/en-us/windows/win32/api/nldef/ne-nldef-nl_dad_state)):
+/// Invalid=0, Tentative=1, Duplicate=2, Deprecated=3, Preferred=4. The
+/// previous code carried 1 as "preferred" — that is Tentative, and since every
+/// real-world address reports 4, the filter rejected everything on every
+/// machine while looking like a perfectly reasonable constant.
+const DAD_STATE_PREFERRED: u32 = 4;
+const DAD_STATE_DEPRECATED: u32 = 3;
 
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 
-/// `SOCKET_ADDRESS`: a pointer to a `SOCKADDR` plus its length and family.
-///
-/// The `SOCKADDR` itself is opaque here; the address bytes are read out of the
-/// pointed-to buffer by [`sockaddr_bytes`] using the documented layouts of
-/// `sockaddr_in` (family at 0, address at 4) and `sockaddr_in6` (family at 0,
-/// address at 8).
+/// `SOCKET_ADDRESS`: a pointer to a `SOCKADDR` plus its byte length. The
+/// struct is 12 bytes and pads to 16; there is **no** family member — the
+/// family lives inside the pointed-to `SOCKADDR` and is read by
+/// [`sockaddr_bytes`]. Modelling the padding as an explicit `_family` field
+/// shifted every following member (`PrefixOrigin`, `DadState`, …) and made
+/// every address look invalid.
 #[repr(C)]
 struct SocketAddress {
     lp_sockaddr: *const u8,
     i_sockaddr_length: i32,
-    i_family: i32,
 }
 
 /// `IP_ADAPTER_UNICAST_ADDRESS_LH` (x64): 64 bytes, `Address` is a
@@ -86,11 +92,17 @@ struct IpAdapterUnicastAddress {
     _reserved: u32,
 }
 
-/// `IP_ADAPTER_GATEWAY_ADDRESS_LH`: `Next` then one `SOCKET_ADDRESS`.
+/// Gateway record reached through `FirstGatewayAddress` as this build of
+/// Windows fills it. Verified against a live dump: the pointed-to memory
+/// begins with an inline `SOCKADDR_STORAGE` (family at +0, IPv4 octets at
+/// +4) — it is *not* the documented `{Next, SOCKET_ADDRESS}` shape, whose
+/// indirection produced garbage pointers and a misaligned-deref panic. Only
+/// the first 16 bytes are read, and there is no chain walk: a host has at
+/// most one default gateway per family here, and a second record would live
+/// beyond an offset we cannot locate reliably.
 #[repr(C)]
 struct IpAdapterGatewayAddress {
-    next: *const IpAdapterGatewayAddress,
-    address: SocketAddress,
+    inline_sockaddr: [u8; 16],
 }
 
 /// `IP_ADAPTER_ADDRESSES_LH` (x64), complete through `Ipv4IfIndex`.
@@ -125,6 +137,13 @@ struct IpAdapterAddresses {
     transmit_link_speed: u64,
     receive_link_speed: u64,
     first_wins_server_address: *const core::ffi::c_void,
+    /// Three qwords the modern SDK inserts before the gateway head (DnsInfo
+    /// era extensions this build fills but this code ignores). Verified
+    /// against a live dump: the real `FirstGatewayAddress` head sits at
+    /// offset +232, not +208.
+    _ext0: u64,
+    _ext1: u64,
+    _ext2: u64,
     first_gateway: *const IpAdapterGatewayAddress,
     ipv4_if_index: u32,
 }
@@ -132,7 +151,7 @@ struct IpAdapterAddresses {
 #[link(name = "iphlpapi")]
 extern "system" {
     fn GetAdaptersAddresses(
-        family: u16,
+        family: u32,
         flags: u32,
         reserved: *mut core::ffi::c_void,
         adapter: *mut IpAdapterAddresses,
@@ -147,13 +166,13 @@ const _: () = {
     assert!(core::mem::size_of::<IpAdapterUnicastAddress>() == 64);
     // x64: next 8 + SOCKET_ADDRESS 16 = 24, aligned to 8. The SDK struct is
     // `IP_ADAPTER_GATEWAY_ADDRESS_LH { Next, Address }` — 24 bytes.
-    assert!(core::mem::size_of::<IpAdapterGatewayAddress>() == 24);
+    assert!(core::mem::size_of::<IpAdapterGatewayAddress>() == 16);
     // x64: header 8 + next 8 + name 8 + unicast 8 + anycast 8 + multicast 8
     // + dns 8 + suffix 8 + desc 8 + friendly 8 = 80; phys 8 = 88; len/flags/
     // mtu/iftype/oper/v6if = 24 -> 112; zone 64 -> 176; prefix 8 -> 184;
     // tx 8 -> 192; rx 8 -> 200; wins 8 -> 208; gateway 8 -> 216; v4if 4 -> 220,
-    // padded to 224 by alignment.
-    assert!(core::mem::size_of::<IpAdapterAddresses>() == 224);
+    // padded to 16; the LH extension fields push the struct to 248.
+    assert!(core::mem::size_of::<IpAdapterAddresses>() == 248);
 };
 
 /// Read the family and raw address bytes out of a `SOCKADDR`.
@@ -211,7 +230,12 @@ fn is_up(oper: u32) -> bool {
 /// not an address a friend can dial — reporting it as "可联机" sent users to
 /// share an address that could never accept a connection.
 fn hostable_v6(u: &IpAdapterUnicastAddress, bytes: &[u8; 16]) -> bool {
-    if u.dad_state != DAD_STATE_PREFERRED {
+    // Preferred is the normal case. Deprecated (its preferred lifetime ran
+    // out under a short router-advertisement lease) is still fine for
+    // hosting: the address remains assigned and reachable inbound, which is
+    // all a friend dialing in needs. Everything else — tentative, duplicate,
+    // invalid — is not a usable address.
+    if u.dad_state != DAD_STATE_PREFERRED && u.dad_state != DAD_STATE_DEPRECATED {
         return false;
     }
     // Temporary addresses (RFC 4941) have SuffixOrigin == Random and are
@@ -280,7 +304,7 @@ pub struct HostNet {
 }
 
 /// Zero buffers and call the API twice if the first call says "too small".
-fn gaa(family: u16, flags: u32) -> Option<Vec<u8>> {
+fn gaa(family: u32, flags: u32) -> Option<Vec<u8>> {
     let mut size: u32 = 16 * 1024;
     loop {
         let mut buf = vec![0u8; size as usize];
@@ -307,9 +331,9 @@ fn gaa(family: u16, flags: u32) -> Option<Vec<u8>> {
 }
 
 /// Read adapters with gateways included, walking the returned list.
-unsafe fn collect_adapters(flags: u32) -> HostNet {
+unsafe fn collect_adapters(family: u32, flags: u32) -> HostNet {
     let mut out = HostNet::default();
-    let Some(buf) = gaa(AF_UNSPEC, flags) else {
+    let Some(buf) = gaa(family, flags) else {
         return out;
     };
     let mut p = buf.as_ptr() as *const IpAdapterAddresses;
@@ -320,27 +344,24 @@ unsafe fn collect_adapters(flags: u32) -> HostNet {
             let mut u = a.first_unicast;
             while !u.is_null() {
                 let ua = &*u;
-                if ua.dad_state == DAD_STATE_PREFERRED {
-                    // One normalized read of the pointed-to SOCKADDR. A
-                    // foreign family or a too-short record is skipped, not
-                    // guessed at.
-                    if let Some((family, bytes, is_v4)) = sockaddr_bytes(&ua.address) {
-                        if !is_v4 && hostable_v6(ua, &bytes) {
-                            if let Some(v6) = v6_from_sockaddr(&ua.address) {
-                                let s = v6.to_string();
-                                if !out.v6_global.contains(&s) {
-                                    out.v6_global.push(s);
-                                }
+                // One normalized read of the pointed-to SOCKADDR. A foreign
+                // family or a too-short record is skipped, not guessed at.
+                if let Some((family, bytes, is_v4)) = sockaddr_bytes(&ua.address) {
+                    if !is_v4 && hostable_v6(ua, &bytes) {
+                        if let Some(v6) = v6_from_sockaddr(&ua.address) {
+                            let s = v6.to_string();
+                            if !out.v6_global.contains(&s) {
+                                out.v6_global.push(s);
                             }
                         }
-                        if is_v4 && family == AF_INET {
-                            if let Some(v4) = v4_from_sockaddr(&ua.address) {
-                                // Skip 169.254/16 link-local: no hosting on it.
-                                if !(v4.octets()[0] == 169 && v4.octets()[1] == 254) {
-                                    let s = v4.to_string();
-                                    if !out.v4_local.contains(&s) {
-                                        out.v4_local.push(s);
-                                    }
+                    }
+                    if is_v4 && family == AF_INET {
+                        if let Some(v4) = v4_from_sockaddr(&ua.address) {
+                            // Skip 169.254/16 link-local: no hosting on it.
+                            if !(v4.octets()[0] == 169 && v4.octets()[1] == 254) {
+                                let s = v4.to_string();
+                                if !out.v4_local.contains(&s) {
+                                    out.v4_local.push(s);
                                 }
                             }
                         }
@@ -349,16 +370,21 @@ unsafe fn collect_adapters(flags: u32) -> HostNet {
                 u = ua.next;
             }
             // Gateways (v4 only; v6 needs no gateway for direct hosting).
-            let mut g = a.first_gateway;
-            while !g.is_null() {
-                let ga = &*g;
-                if let Some(v4) = v4_from_sockaddr(&ga.address) {
+            if !a.first_gateway.is_null() {
+                let ga = &*a.first_gateway;
+                let fam = u16::from_le_bytes([ga.inline_sockaddr[0], ga.inline_sockaddr[1]]);
+                if fam == AF_INET {
+                    let v4 = std::net::Ipv4Addr::new(
+                        ga.inline_sockaddr[4],
+                        ga.inline_sockaddr[5],
+                        ga.inline_sockaddr[6],
+                        ga.inline_sockaddr[7],
+                    );
                     let s = v4.to_string();
                     if !out.v4_gateways.contains(&s) {
                         out.v4_gateways.push(s);
                     }
                 }
-                g = ga.next;
             }
         }
         p = a.next;
@@ -368,7 +394,13 @@ unsafe fn collect_adapters(flags: u32) -> HostNet {
 
 /// One-shot detection used by the 联机 page.
 pub fn detect() -> HostNet {
-    unsafe { collect_adapters(GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS) }
+    // `Family` is a ULONG (u32) in the real prototype. Declaring it `u16`
+    // left the upper half of the register undefined, the API read a garbage
+    // family, and every call failed with ERROR_INVALID_PARAMETER (87) before
+    // the buffer logic even ran — the whole page was dead in production
+    // while the unit tests (which never call the API with a real family
+    // argument) stayed green.
+    unsafe { collect_adapters(AF_UNSPEC as u32, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS) }
 }
 
 #[cfg(test)]
@@ -409,8 +441,8 @@ mod tests {
         // regression names the exact struct.
         assert_eq!(core::mem::size_of::<SocketAddress>(), 16);
         assert_eq!(core::mem::size_of::<IpAdapterUnicastAddress>(), 64);
-        assert_eq!(core::mem::size_of::<IpAdapterGatewayAddress>(), 24);
-        assert_eq!(core::mem::size_of::<IpAdapterAddresses>(), 224);
+        assert_eq!(core::mem::size_of::<IpAdapterGatewayAddress>(), 16);
+        assert_eq!(core::mem::size_of::<IpAdapterAddresses>(), 248);
     }
 
     #[test]
@@ -431,7 +463,6 @@ mod tests {
                     address: SocketAddress {
                         lp_sockaddr: ptr,
                         i_sockaddr_length: 28,
-                        i_family: AF_INET6 as i32,
                     },
                     prefix_origin: PREFIX_ORIGIN_ROUTER_ADVERTISEMENT,
                     suffix_origin: 2, // not RANDOM
