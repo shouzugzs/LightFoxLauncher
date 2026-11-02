@@ -5865,12 +5865,24 @@ fn notify_startup(app: &mut App) {
         let w = wide(&url);
         SetWindowTextW(app.notify_url, w.as_ptr());
     }
+    // Show the last cached feed before anything networked happens, so old
+    // announcements are reviewable immediately and offline. It is marked as
+    // such; the live check (below) replaces it with fresh data.
+    if app.feed.is_none() {
+        if let Some(cached) = lightfox::notify::load_cache(&notify_dir(app)) {
+            app.feed = Some(cached);
+            notify_rebuild_list(app);
+            set_notify_status(app, "显示的是上次缓存的公告；点“检查更新”获取最新内容。");
+        }
+    }
     match app.settings.feed_url.clone() {
         Some(url) if app.settings.check_feed && !url.trim().is_empty() => {
             notify_fetch(app, url, true);
         }
         _ => {
-            set_notify_status(app, notify_idle_hint(app));
+            if app.feed.is_none() {
+                set_notify_status(app, notify_idle_hint(app));
+            }
         }
     }
 }

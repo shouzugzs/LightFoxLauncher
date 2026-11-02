@@ -457,12 +457,47 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The cache file: the last successfully fetched document, verbatim.
+///
+/// The seen-file records *which* notes were read; this records *what* they
+/// said. Without it the 通知 page starts empty every launch and old
+/// announcements cannot be reviewed until the next successful fetch — which,
+/// on a machine that is briefly offline, means the user can look at nothing.
+const CACHE_FILE: &str = "lfl-feed-cache.json";
+
+/// Store the raw document of a successful fetch.
+///
+/// Best-effort: a failed write only costs the offline review feature, never a
+/// fetch. The text is the already size-capped body, so the cache cannot grow
+/// beyond [`MAX_BODY`].
+pub fn save_cache(dir: &Path, text: &str) {
+    let _ = std::fs::write(dir.join(CACHE_FILE), text);
+}
+
+/// Load the cached document, if one exists and is plausibly intact.
+///
+/// "Plausibly" means it parses with the same rules a live fetch would face —
+/// a truncated or hand-corrupted cache is dropped rather than shown.
+pub fn load_cache(dir: &Path) -> Option<Feed> {
+    let text = std::fs::read_to_string(dir.join(CACHE_FILE)).ok()?;
+    if text.len() > MAX_BODY {
+        return None;
+    }
+    parse(&text).ok()
+}
+
 /// Fetch and parse the feed at `url`.
 ///
 /// One request, no retry: this runs on a worker thread while the user waits, and
 /// a broken announcement endpoint must never make the launcher feel slow. A
 /// failure is reported as an error string, and the caller keeps the previous
 /// state.
+///
+/// A successful fetch is also written to the local cache file, so the 通知 page
+/// can show the notes again after a restart (or offline) instead of starting
+/// blank until the next successful check. Writing the cache here — the one
+/// place that has both the text and proof that it parsed — keeps the GUI free
+/// of cache plumbing.
 pub fn fetch(url: &str) -> Res<Feed> {
     let url = url.trim();
     if url.is_empty() {
@@ -494,7 +529,11 @@ pub fn fetch(url: &str) -> Res<Feed> {
     // a hostile endpoint could push a gigabyte into memory first.
     let body = crate::net::get_max(url, MAX_BODY).map_err(|e| format!("拉取通知失败：{e}"))?;
     let text = String::from_utf8_lossy(&body);
-    parse(&text)
+    let feed = parse(&text)?;
+    // Only a fully parsed document is cached, so a publisher cannot poison the
+    // offline copy with a payload the parser would reject on reload anyway.
+    save_cache(&crate::util::default_dir(), &text);
+    Ok(feed)
 }
 
 #[cfg(test)]
@@ -841,6 +880,27 @@ mod tests {
         let f3 = parse("{\"notes\":[{\"id\":\"公告🦊\",\"title\":\"1.21.9 支持\"}]}").expect("parse");
         assert_eq!(f3.notes[0].id, "公告🦊");
         assert_eq!(f3.notes[0].title, "1.21.9 支持");
+    }
+
+    #[test]
+    fn feed_cache_round_trips_and_rejects_garbage() {
+        // The cache is what makes old announcements reviewable after a
+        // restart, so the load path must parse with the same rules a live
+        // fetch uses — and drop a truncated/corrupted file rather than show it.
+        let dir = temp("cache");
+        let doc = r#"{"latest":"0.4.1","notes":[{"id":"n1","date":"2026-11-01","title":"t","body":"b"}]}"#;
+        save_cache(&dir, doc);
+        let f = load_cache(&dir).expect("cached feed reloads");
+        assert_eq!(f.latest.as_deref(), Some("0.4.1"));
+        assert_eq!(f.notes.len(), 1);
+        // A corrupted cache is dropped, not surfaced.
+        std::fs::write(dir.join("lfl-feed-cache.json"), "{oops").unwrap();
+        assert!(load_cache(&dir).is_none(), "garbage cache must be dropped");
+        // No cache at all is None, not an error.
+        let empty = temp("cache-empty");
+        assert!(load_cache(&empty).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]
