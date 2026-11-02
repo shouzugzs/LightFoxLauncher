@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.2
+
+### Fixed
+
+* 联机页「检测网络」在本机上永远为空的 Bug。三个叠加的 FFI 错误：
+  - `GetAdaptersAddresses` 的 `Family` 参数声明成了 `u16`（真实原型是 `ULONG`/u32），
+    x64 调用时寄存器高半部分是垃圾值，API 恒返回 87（ERROR_INVALID_PARAMETER）；
+  - `DAD_STATE_PREFERRED` 常量写成 1（那是 Tentative），真实地址全部报 4，过滤器
+    拒绝了所有地址；同时接受 Deprecated=3 —— RA 租期短的地址几分钟后会进入该状态，
+    入站仍然可达；
+  - `SOCKET_ADDRESS` 没有 family 成员（多写的字段把后面字段全部偏移搞错）；
+    `FirstGatewayAddress` 在当前 Windows 位于 +232 且指向内联 sockaddr，实测确认。
+* 通知回看：检查更新失败时显示上次缓存的公告（0.4.1 已加入）。
+
 ## 0.4.1
 
 联机（play together）— IPv6/IPv4 direct hosting plus a room-code shortcut so
