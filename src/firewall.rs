@@ -12,6 +12,12 @@
 //! with a fixed, launcher-owned name so they can be found and removed again;
 //! nothing else in the firewall is ever touched.
 //!
+//! On every other platform this module compiles to a stub: there is no `netsh`,
+//! no `CREATE_NO_WINDOW` process flag and no firewall API the launcher may drive
+//! unattended. `add_rule` reports `false` (the caller already treats that as "no
+//! rule"), `remove_rule` succeeds as a no-op, and `rule_exists` is always false,
+//! so the UI says "无法自动放行" instead of claiming a hole was opened.
+//!
 //! OWNER: lead.
 
 use crate::util::Res;
@@ -49,6 +55,7 @@ fn delete_owned_rules() -> Res<()> {
 /// hosting port) would stack duplicate rules with the same name — Windows keeps
 /// every copy, which is how a single host ends up with dozens of identical
 /// entries, all widening the same hole.
+#[cfg(windows)]
 pub fn add_rule(port: u16) -> Res<bool> {
     #[cfg(test)]
     let _guard = TEST_FIREWALL_LOCK.lock().unwrap();
@@ -68,6 +75,7 @@ pub fn add_rule(port: u16) -> Res<bool> {
 /// Remove the rules this launcher created. Idempotent: removing a
 /// non-existent rule is a netsh error we swallow, because "already gone" is
 /// the desired end state.
+#[cfg(windows)]
 pub fn remove_rule() -> Res<()> {
     #[cfg(test)]
     let _guard = TEST_FIREWALL_LOCK.lock().unwrap();
@@ -76,6 +84,7 @@ pub fn remove_rule() -> Res<()> {
 
 /// True when at least one of our rules is present (query does not need
 /// elevation, so this is cheap to show in the UI).
+#[cfg(windows)]
 pub fn rule_exists() -> bool {
     match run_netsh(&format!(
         "advfirewall firewall show rule name=\"{RULE_NAME}\""
@@ -86,6 +95,12 @@ pub fn rule_exists() -> bool {
 }
 
 /// Run `netsh <args>` via cmd. Returns Ok(true) when netsh exited 0.
+///
+/// `CREATE_NO_WINDOW` matters: without it the console `netsh` allocates flashes
+/// a black window over the launcher. `CommandExt` is imported inside the
+/// function rather than at module level so the import cannot leak into a
+/// non-Windows build.
+#[cfg(windows)]
 fn run_netsh(args: &str) -> Res<bool> {
     use std::os::windows::process::CommandExt;
     let out = std::process::Command::new("cmd")
@@ -94,6 +109,35 @@ fn run_netsh(args: &str) -> Res<bool> {
         .output()
         .map_err(|e| format!("无法执行 netsh：{e}"))?;
     Ok(out.status.success())
+}
+
+// ---- non-Windows stubs -----------------------------------------------------
+//
+// The hosting page is reachable on every platform, so these must exist and be
+// callable; they simply cannot do the Windows-specific work. Returning
+// `Ok(false)` from `add_rule` is the contract the caller already handles (it
+// means "no rule was created"), which keeps the UI honest instead of silently
+// pretending a port was opened.
+
+#[cfg(not(windows))]
+fn run_netsh(_args: &str) -> Res<bool> {
+    Ok(false)
+}
+
+#[cfg(not(windows))]
+#[allow(unused_variables)]
+pub fn add_rule(port: u16) -> Res<bool> {
+    Ok(false)
+}
+
+#[cfg(not(windows))]
+pub fn remove_rule() -> Res<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn rule_exists() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -142,12 +186,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn add_rule_is_idempotent_and_not_port_fragile() {
         // Regression: repeated 开服 clicks (and switching the port) must not
-        // stack duplicate rules. On non-Windows there is no netsh, so skip.
-        if !cfg!(windows) {
-            return;
-        }
+        // stack duplicate rules. Gated at compile time rather than with a
+        // runtime `cfg!` check: `count_our_rules` only exists on Windows, so a
+        // runtime guard would still have to type-check the body here.
         let _ = remove_rule();
         // Creating rules needs elevation; if we are not elevated the command
         // fails (add_rule reports Ok(false)) and there is nothing to verify.

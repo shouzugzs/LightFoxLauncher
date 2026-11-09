@@ -148,6 +148,7 @@ struct IpAdapterAddresses {
     ipv4_if_index: u32,
 }
 
+#[cfg(windows)]
 #[link(name = "iphlpapi")]
 extern "system" {
     fn GetAdaptersAddresses(
@@ -304,6 +305,7 @@ pub struct HostNet {
 }
 
 /// Zero buffers and call the API twice if the first call says "too small".
+#[cfg(windows)]
 fn gaa(family: u32, flags: u32) -> Option<Vec<u8>> {
     let mut size: u32 = 16 * 1024;
     loop {
@@ -331,6 +333,7 @@ fn gaa(family: u32, flags: u32) -> Option<Vec<u8>> {
 }
 
 /// Read adapters with gateways included, walking the returned list.
+#[cfg(windows)]
 unsafe fn collect_adapters(family: u32, flags: u32) -> HostNet {
     let mut out = HostNet::default();
     let Some(buf) = gaa(family, flags) else {
@@ -393,6 +396,14 @@ unsafe fn collect_adapters(family: u32, flags: u32) -> HostNet {
 }
 
 /// One-shot detection used by the 联机 page.
+///
+/// On Windows this is pure `GetAdaptersAddresses`. Elsewhere it reports an empty
+/// [`HostNet`]: there is no portable equivalent that enumerates global IPv6
+/// addresses, the default IPv4 gateway and adapter state in one call, and the
+/// page's contract is already "no addresses found ⇒ say so", so the UI
+/// degrades to its existing message instead of the build failing to link
+/// `iphlpapi`.
+#[cfg(windows)]
 pub fn detect() -> HostNet {
     // `Family` is a ULONG (u32) in the real prototype. Declaring it `u16`
     // left the upper half of the register undefined, the API read a garbage
@@ -401,6 +412,11 @@ pub fn detect() -> HostNet {
     // while the unit tests (which never call the API with a real family
     // argument) stayed green.
     unsafe { collect_adapters(AF_UNSPEC as u32, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS) }
+}
+
+#[cfg(not(windows))]
+pub fn detect() -> HostNet {
+    HostNet::default()
 }
 
 #[cfg(test)]

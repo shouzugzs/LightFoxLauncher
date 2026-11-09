@@ -79,7 +79,21 @@ drifted away from the controls they wrapped, headings were painted across the fi
 card, and rows lost their common baseline.
 
 ```rust
-const PAD: i32 = 18;        // outer margin, left edge of the label column
+// Window chrome — brand band, nav rail, page header, status band.
+const HEADER_H: i32 = 56;      // brand band along the top
+const NAV_W: i32 = 176;        // navigation rail on the left
+const NAV_TOP: i32 = HEADER_H;
+const NAV_ITEM_H: i32 = 34;    // one rail entry
+const NAV_ITEM_GAP: i32 = 3;
+const NAV_RAIL_PAD: i32 = 10;  // rail entry inset from the rail's own edges
+const NAV_CAP_H: i32 = 36;     // the "导航" caption above the first entry
+const PAGE_HEAD_H: i32 = 54;   // title + subtitle band inside a page
+const FOOT_H: i32 = 34;        // status band along the bottom
+const TABS: usize = 8;
+const PAGES: [(&str, &str, &str); TABS] = [ /* rail label, title, subtitle */ ];
+
+// Page content.
+const PAD: i32 = 18;        // page inset; also where the label column starts
 const LABEL_W: i32 = 76;    // width of the "版本" / "游戏目录" label column
 const ROW_H: i32 = 28;      // the height of *every* control in a row
 const GAP: i32 = 12;        // horizontal gap between two controls in a row
@@ -87,20 +101,23 @@ const ROW_GAP: i32 = 38;    // vertical distance between row baselines
 const CARD_PAD: i32 = 12;   // inner padding between a card's edge and its content
 const HEAD_H: i32 = 28;     // band reserved at the top of a card for its heading
 const DROP_ROW: i32 = 22;   // height of one drop-down list row
-const BODY_TOP: i32 = CHROME_TOP + TAB_H + 16;
+const BODY_TOP: i32 = NAV_TOP + PAGE_HEAD_H;
 ```
 
 Helpers — both `layout()` and `paint()` must go through these:
 
 | Helper | Meaning |
 |---|---|
-| `row_x()` | `PAD + LABEL_W` — first control of a row, on a page with a label column |
-| `card_x()` | `PAD + CARD_PAD` — first control inside a card, on a page without one |
+| `page_x()` | `NAV_W + PAD` — the page column's left edge; every page hangs off this |
+| `page_bottom(ch)` | `ch - FOOT_H - PAD` — the lowest y content may use |
+| `row_x()` | `page_x() + LABEL_W` — first control of a row, on a page with a label column |
+| `card_x()` | `page_x() + CARD_PAD` — first control inside a card |
 | `row_y(top, n)` | `top + n * ROW_GAP` |
 | `content_y(top, heading)` | first control row inside a card (`HEAD_H` if it has a heading, else `CARD_PAD`) |
 | `card_end(top, rows, heading)` | bottom edge of a card holding `rows` rows |
 | `combo_h(rows)` | `ROW_H + rows * DROP_ROW` — a **pure** function of the item count |
 | `normalize_combo(h)` | pins a combo's *closed* height to `ROW_H` via `CB_SETITEMHEIGHT` |
+| `nav_item_top(i)` / `nav_item_rect(i)` | the rail entry's y, and the one rect used for both hit-testing and painting |
 
 Three rules that exist because breaking them is what produced the visible misalignment:
 
@@ -113,7 +130,52 @@ Three rules that exist because breaking them is what produced the visible misali
    card's inner inset left a 76 px dead gutter inside every card on the 下载 / 模组 / 版本 / 工具
    pages.
 
-Lists and cards stop at `ch - CARD_PAD - PAD`. The minimum window size is 700×580.
+Lists and cards stop at `page_bottom(ch) - CARD_PAD`. The minimum window size is 820×600.
+
+4. **Never use a bare `PAD` for page content.** The page column starts at `page_x()`; `PAD` is
+   only the inset *inside* that column and the left edge of the label column. Using `PAD` as a
+   page's left edge put content underneath the navigation rail.
+
+### Theme contract
+
+Palettes are **data**, not drawing code. `THEMES` in `src/gui/win_main.rs` holds plain sRGB byte
+tuples; `apply_theme(app, index, persist)` is the single adapter that turns them into renderer
+state. A new theme is one more entry in `THEMES` — no paint code changes. Replacing the renderer
+means rewriting `apply_theme` only; the palette table and every `App` field stay as they are.
+
+`apply_theme` must, in one pass:
+
+1. write `app.{bg,card,raised,ink,dim,line,accent,accent_hi}` (already COLORREF, `0x00BBGGRR`);
+2. `DeleteObject` the previous `card_brush` / `bg_brush`, then `CreateSolidBrush` new ones — the
+   `WM_CTLCOLOR*` handlers hand these handles straight to GDI, so they cannot be mutated in place;
+3. rewrite `BTN_THEME` (read on every `WM_DRAWITEM`);
+4. re-colour the progress bar with `PBM_SETBKCOLOR` / `PBM_SETBARCOLOR`, converting through
+   `rgb(r,g,b)` — never passing a raw `0xRRGGBB`;
+5. rebuild both `HICON`s and install them with `WM_SETICON` (`ICON_BIG`, `ICON_SMALL`), then
+   `DestroyIcon` the previous pair;
+6. when `persist`, write `theme=<key>` through `Settings::save` and `CB_SETCURSEL` the combo;
+7. `RedrawWindow(..., RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW)` so child
+   controls pick up the new `WM_CTLCOLOR*` brushes without a resize.
+
+A theme key is a short ASCII token ([`settings::valid_theme_name`]). Unknown keys fall back to the
+default rather than failing to load: a hand-edited `theme=` must never make the launcher unopenable.
+
+### Platform contract
+
+`LFL-gui` is native Win32 and Windows-only; off Windows the binary compiles to a stub that points
+at the CLI. The **library** is portable, and three modules carry the seams — each keeps a
+`#[cfg(windows)]` implementation beside a documented `#[cfg(not(windows))]` fallback, never a
+`todo!()`:
+
+| Module | Windows | Other platforms |
+|---|---|---|
+| `net` | WinHTTP: HTTPS, proxies, redirects | `std::net::TcpStream`, HTTP/1.1, `chunked`, `Range`; `https://` is an explicit error |
+| `firewall` | `netsh advfirewall` rules | `add_rule` → `Ok(false)`, `remove_rule` → `Ok(())`, `rule_exists` → `false` |
+| `hostnet` | `GetAdaptersAddresses` | empty `HostNet` (the page says "no addresses found") |
+
+`java::PLATFORM` selects the runtime-manifest key per target. `scripts/cross-check.ps1` asserts all
+of the above and runs `cargo check --all-targets --target <foreign>`; a full foreign *link* needs a
+cross linker, and the script reports that as `skipped`, never as a pass.
 
 ## src/notify.rs (lead)
 

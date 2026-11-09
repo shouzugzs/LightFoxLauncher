@@ -71,6 +71,19 @@ pub struct Settings {
     /// room server is only ever contacted when the user presses 建房号 or
     /// 用房间号连接 — never on startup.
     pub room_server: Option<String>,
+    /// Active GUI theme name, stored as a plain token. The GUI maps unknown
+    /// names back to its default, so an old or hand-edited value can never
+    /// break settings loading.
+    pub theme: String,
+}
+
+/// A theme name is a short ASCII token. Kept deliberately permissive: the
+/// rendering layer owns the list of *known* themes and falls back gracefully.
+pub fn valid_theme_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 impl Default for Settings {
@@ -88,6 +101,7 @@ impl Default for Settings {
             check_feed: false,
             feed_prompted: false,
             room_server: None,
+            theme: "fox".to_string(),
         }
     }
 }
@@ -138,6 +152,7 @@ impl Settings {
                     saw_prompted = true;
                 }
                 "room_server" if !v.is_empty() => out.room_server = Some(v.to_string()),
+                "theme" if !v.is_empty() => out.theme = v.to_string(),
                 _ => {}
             }
         }
@@ -177,7 +192,8 @@ impl Settings {
              feed_url={}\n\
              check_feed={}\n\
              feed_prompted={}\n\
-             room_server={}\n",
+             room_server={}\n\
+             theme={}\n",
             self.workers,
             one_line(&self.java.clone().unwrap_or_default()),
             one_line(&self.memory),
@@ -189,6 +205,7 @@ impl Settings {
             self.check_feed as u8,
             self.feed_prompted as u8,
             one_line(&self.room_server.clone().unwrap_or_default()),
+            one_line(&self.theme),
         );
         let target = Settings::file(dir);
         let tmp = dir.join("lfl-settings.ini.tmp");
@@ -211,6 +228,9 @@ impl Settings {
 
     /// Cross-check the values a settings form can produce.
     pub fn validate(&self) -> Result<(), String> {
+        if !valid_theme_name(&self.theme) {
+            return Err("theme: must be 1..=32 ASCII letters, digits, '_' or '-'".to_string());
+        }
         crate::launcher::validate_memory(&self.memory)?;
         crate::launcher::validate_instance_name(&self.instance)?;
         if self.user.is_empty() || self.user.len() > 16 {
@@ -291,6 +311,10 @@ pub fn load_and_apply(dir: &Path) -> Settings {
             s.feed_url = None;
         }
     }
+    if !valid_theme_name(&s.theme) {
+        problems.push("theme: invalid name, reset to default".to_string());
+        s.theme = Settings::default().theme;
+    }
     if let Some(u) = &s.room_server {
         let lower = u.trim().to_ascii_lowercase();
         if !lower.is_empty() && !lower.starts_with("https://") && !lower.starts_with("http://") {
@@ -338,6 +362,7 @@ mod tests {
             check_feed: false,
             feed_prompted: true,
             room_server: Some("https://rooms.example".to_string()),
+            theme: "night".to_string(),
         };
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);

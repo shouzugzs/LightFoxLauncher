@@ -279,7 +279,12 @@ pub const SWP_SHOWWINDOW: UINT = 0x0040;
 pub const SW_HIDE: i32 = 0;
 
 pub const WM_SETICON: UINT = 0x0080;
+pub const ICON_SMALL: DWORD = 0;
 pub const ICON_BIG: DWORD = 1;
+pub const RDW_INVALIDATE: UINT = 0x0001;
+pub const RDW_ERASE: UINT = 0x0004;
+pub const RDW_ALLCHILDREN: UINT = 0x0080;
+pub const RDW_UPDATENOW: UINT = 0x0100;
 pub const IMAGE_ICON: UINT = 1;
 pub const LR_LOADFROMFILE: UINT = 0x0010;
 pub const LR_DEFAULTSIZE: UINT = 0x0040;
@@ -337,10 +342,18 @@ extern "system" {
     pub fn FillRect(hdc: HDC, r: *const RECT, brush: HBRUSH) -> i32;
     pub fn DrawTextW(hdc: HDC, text: *const u16, len: i32, r: *mut RECT, fmt: UINT) -> i32;
     pub fn SetTimer(hwnd: HWND, id: usize, elapse: UINT, func: *mut c_void) -> usize;
+    pub fn RedrawWindow(
+        hwnd: HWND,
+        rect: *const RECT,
+        rgn: *mut c_void,
+        flags: UINT,
+    ) -> BOOL;
     pub fn KillTimer(hwnd: HWND, id: usize) -> BOOL;
     pub fn MessageBoxW(hwnd: HWND, text: *const u16, caption: *const u16, kind: UINT) -> i32;
     pub fn LoadCursorW(instance: HINSTANCE, name: usize) -> *mut c_void;
     pub fn LoadIconW(instance: HINSTANCE, name: usize) -> HICON;
+    /// Free an icon built with `CreateIconIndirect` (and the bitmaps inside it).
+    pub fn DestroyIcon(icon: HICON) -> BOOL;
     pub fn LoadImageW(instance: HINSTANCE, name: *const u16, kind: UINT, cx: i32, cy: i32, load: UINT)
         -> *mut c_void;
     pub fn SetForegroundWindow(hwnd: HWND) -> BOOL;

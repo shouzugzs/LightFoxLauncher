@@ -4,11 +4,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! LightFox — a tiny, zero-dependency Minecraft launcher for Windows.
+//! LightFox — a tiny, zero-dependency Minecraft launcher.
 //!
-//! This library crate holds everything the two front-ends share; the
+//! This library crate holds everything the front-ends share; the
 //! [`LFL`](../LFL/index.html) CLI and the `LFL-gui` windowed launcher are thin
 //! shells over it.
+//!
+//! # Platforms
+//!
+//! Both front-ends target Windows, and `LFL-gui` is native Win32 — there is no
+//! portable window toolkit here and no crate to supply one. The **library**,
+//! however, builds and runs on any platform Rust supports:
+//!
+//! * Windows uses WinHTTP for transfers and `GetAdaptersAddresses` for host
+//!   detection, so HTTPS, proxies and IPv6 hosting all work.
+//! * Everywhere else `net` falls back to a plain HTTP/1.1 client over
+//!   `std::net::TcpStream` (no TLS without a crate, so `https://` reports a
+//!   clear error), `firewall` and `hostnet` become honest no-ops, and the CLI is
+//!   fully usable against `http://` mirrors.
+//!
+//! The platform seams are `net.rs`, `firewall.rs` and `hostnet.rs`; each keeps a
+//! `#[cfg(windows)]` implementation beside a documented fallback rather than a
+//! `todo!()`.
 //!
 //! Module APIs are frozen in `docs/CONTRACT.md`.
 //!

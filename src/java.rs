@@ -34,7 +34,27 @@ const RUNTIME_INDEX: &str =
     "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 /// Fedora-style fallback is deliberately absent: this launcher targets the
 /// exact manifest the vanilla launcher uses.
+///
+/// The key names a per-platform runtime bundle in that manifest. Only
+/// `windows-x64` is shipped as a supported target; the other arms exist so a
+/// non-Windows build resolves to the matching key rather than asking Mojang for
+/// a Windows runtime it cannot execute.
+#[cfg(all(windows, target_arch = "x86_64"))]
 const PLATFORM: &str = "windows-x64";
+#[cfg(all(windows, target_arch = "x86"))]
+const PLATFORM: &str = "windows-x86";
+#[cfg(all(windows, not(any(target_arch = "x86_64", target_arch = "x86"))))]
+const PLATFORM: &str = "windows-arm64";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PLATFORM: &str = "mac-os-arm64";
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+const PLATFORM: &str = "mac-os";
+#[cfg(all(unix, not(target_os = "macos"), target_arch = "x86_64"))]
+const PLATFORM: &str = "linux";
+#[cfg(all(unix, not(target_os = "macos"), target_arch = "x86"))]
+const PLATFORM: &str = "linux-i386";
+#[cfg(all(unix, not(target_os = "macos"), not(any(target_arch = "x86_64", target_arch = "x86"))))]
+const PLATFORM: &str = "linux";
 
 /// A usable Java installation.
 #[derive(Debug, Clone, PartialEq)]

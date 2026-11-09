@@ -10,13 +10,20 @@ Version 0.4.3 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 The product is **LightFoxLauncher**. The command line is `LFL`, the window title is
 `LightFoxLauncher`, and the crate is `lightfox`.
 
-A small Windows launcher for Minecraft, in two front-ends over one shared engine. No GUI toolkit,
-no login server, no runtime dependencies — just the game.
+A small Minecraft launcher, in two front-ends over one shared engine. No GUI toolkit,
+no login server, no runtime dependencies — just the game. The window is native Win32;
+the engine and CLI also build and run on Linux and macOS.
 
 | Binary | Size | What it is |
 |---|---|---|
-| `LFL-gui.exe` | **741,376 B (0.71 MiB)** | native Win32 window: pick version, click play |
+| `LFL-gui.exe` | **745,984 B (0.71 MiB)** | native Win32 window: nav rail, five themes, pick version, click play |
 | `LFL.exe` | **526,848 B (0.50 MiB)** | command line, scriptable |
+
+The window has a **theme system**: 暖狐 (default), 雪白, 夜色, 森绿, 星紫, chosen in
+设置 → 主题. The palettes are plain sRGB data (`THEMES` in `src/gui/win_main.rs`);
+one function, `apply_theme`, turns them into COLORREFs, brushes, the title-bar
+icon and the progress-bar colours. Swapping the rendering layer means rewriting
+that one adapter, not the palettes.
 
 ```
 LFL-gui.exe             # the window
@@ -484,7 +491,19 @@ cargo build --release      # builds both binaries
 cargo test                 # 306 offline unit tests (6 network tests ignored), no network needed
 ```
 
-Requires stable Rust with the MSVC toolchain. Windows 8.1+ (WinHTTP). No other build inputs.
+Requires stable Rust. On Windows, the MSVC toolchain (Windows 8.1+ for WinHTTP). No other
+build inputs, and no crates at all.
+
+The **GUI** is native Win32 and Windows-only. The **library and CLI** build anywhere Rust does:
+
+| Platform | `LFL` (CLI) | `LFL-gui` | Transport |
+|---|---|---|---|
+| Windows | yes | yes | WinHTTP: HTTPS, proxies, redirects |
+| Linux / macOS | yes | stub (prints a pointer to `LFL`) | `std::net::TcpStream`, HTTP/1.1, no TLS |
+
+`cargo check --all-targets --target x86_64-unknown-linux-gnu` is the cross check, and
+`scripts/cross-check.ps1` runs it plus the seam assertions. A full non-Windows *link* needs a
+cross linker (`cc`); without one the script says "skipped", never "pass".
 
 Layout:
 
@@ -492,7 +511,8 @@ Layout:
 src/lib.rs        shared engine entry point (module list, version constants)
 src/launcher.rs   prepare/build_launch/spawn — the code both front-ends share
 src/main.rs       LFL      CLI: argument parsing + the subcommands
-src/gui/main.rs   LFL-gui  window, controls, worker thread, log/progress plumbing
+src/gui/main.rs   LFL-gui  entry: dispatches to the Win32 app, or explains itself off Windows
+src/gui/win_main.rs  LFL-gui  window, chrome, pages, worker thread, log/progress plumbing
 src/gui/win32.rs  Win32 + GDI bindings (the only unsafe on the UI side)
 src/settings.rs   persisted settings (lfl-settings.ini), read/written atomically
 src/profiles.rs   per-version launch profiles (lfl-profiles/<name>.ini)
@@ -501,7 +521,9 @@ src/loaders.rs    loader profiles (Fabric/Quilt) and mod jar management
 src/modrinth.rs   Modrinth search + verified mod downloads
 src/deps.rs       mod dependency resolution (required/optional/incompatible)
 src/versionmgr.rs local version management: list, delete, clone
-src/lock.rs       cross-process file locks (Windows share-mode handles)
+src/lock.rs       cross-process file locks (Windows share-mode handles, POSIX elsewhere)
+src/firewall.rs   netsh rules on Windows; documented no-op elsewhere
+src/hostnet.rs    GetAdaptersAddresses on Windows; empty result elsewhere
 src/{json,hash,net,version,libraries,assets,java,zip,inflate,util}.rs
 ```
 
@@ -519,7 +541,9 @@ the Java runtime, leftover partial files, and that the data directory stays insi
 
 ## Notes and limits
 
-- Windows only (WinHTTP, `;` classpath separator, `javaw.exe`).
+- The **GUI** is Windows only (native Win32). The library and CLI are portable; see the table
+  above for what each platform's transport supports. Off Windows the CLI needs `http://` mirrors,
+  because there is no TLS without a crate.
 - No Microsoft authentication, no Realms, no skins/capes.
 - Fabric and Quilt are installed from their published version profiles; Forge and NeoForge only ship
   a Java installer, which would mean executing downloaded code — out of scope.

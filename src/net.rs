@@ -20,10 +20,17 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- WinHTTP FFI
+//
+// Windows talks to WinHTTP: it is part of the OS, handles TLS and proxies, and
+// needs no crate. Every other platform uses the plain-TCP backend further down
+// instead, which is why the FFI and its `Handle` wrapper are gated rather than
+// made to compile everywhere.
 
+#[cfg(windows)]
 type HandleRaw = *mut std::ffi::c_void;
 type Void = std::ffi::c_void;
 
+#[cfg(windows)]
 #[link(name = "winhttp")]
 extern "system" {
     fn WinHttpOpen(
@@ -74,6 +81,7 @@ extern "system" {
     fn WinHttpCloseHandle(handle: HandleRaw) -> i32;
 }
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
     fn GetLastError() -> u32;
@@ -190,14 +198,17 @@ fn effective_workers(todo: usize) -> usize {
         .max(1)
 }
 
+#[cfg(windows)]
 #[inline]
 fn last_error() -> u32 {
     unsafe { GetLastError() }
 }
 
 /// Owned WinHTTP handle, closed on drop.
+#[cfg(windows)]
 struct Handle(HandleRaw);
 
+#[cfg(windows)]
 impl Drop for Handle {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -532,12 +543,14 @@ impl Prog<'_> {
 
 /// Owns every WinHTTP handle of one request. Fields are dropped in
 /// declaration order: request, then connection, then session.
+#[cfg(windows)]
 struct Session {
     request: Handle,
     _connect: Handle,
     _session: Handle,
 }
 
+#[cfg(windows)]
 impl Session {
     /// Open session + connection + request and receive the response headers.
     fn open(url: &Url) -> Res<Session> {
@@ -778,6 +791,42 @@ impl Session {
         Ok(code)
     }
 
+    /// Read up to `buf.len()` bytes of the body; `0` means the body ended.
+    ///
+    /// This is the single point where the download path touches the transport.
+    /// `read_all` and `try_download` both loop on it, so a backend only has to
+    /// provide `open`, `status` and `read_chunk`; resume, hashing, verification
+    /// and progress stay identical on every platform.
+    fn read_chunk(&self, buf: &mut [u8]) -> Res<usize> {
+        let mut avail: u32 = 0;
+        if unsafe { WinHttpQueryDataAvailable(self.request.0, &mut avail) } == 0 {
+            return Err(format!(
+                "net: reading response failed: {}",
+                describe_error(last_error())
+            ));
+        }
+        if avail == 0 {
+            return Ok(0);
+        }
+        let want = avail.min(buf.len() as u32);
+        let mut got: u32 = 0;
+        if unsafe {
+            WinHttpReadData(
+                self.request.0,
+                buf.as_mut_ptr() as *mut Void,
+                want,
+                &mut got,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "net: reading response body failed: {}",
+                describe_error(last_error())
+            ));
+        }
+        Ok(got as usize)
+    }
+
     /// Read the whole body. Only used for small metadata documents.
     ///
     /// `limit` is enforced per chunk, so an oversized response is abandoned
@@ -802,36 +851,11 @@ impl Session {
                     ));
                 }
             }
-            let mut avail: u32 = 0;
-            if unsafe { WinHttpQueryDataAvailable(self.request.0, &mut avail) } == 0 {
-                return Err(format!(
-                    "net: reading response failed: {}",
-                    describe_error(last_error())
-                ));
-            }
-            if avail == 0 {
-                return Ok(out);
-            }
-            let want = avail.min(buf.len() as u32);
-            let mut got: u32 = 0;
-            if unsafe {
-                WinHttpReadData(
-                    self.request.0,
-                    buf.as_mut_ptr() as *mut Void,
-                    want,
-                    &mut got,
-                )
-            } == 0
-            {
-                return Err(format!(
-                    "net: reading response body failed: {}",
-                    describe_error(last_error())
-                ));
-            }
+            let got = self.read_chunk(&mut buf)?;
             if got == 0 {
                 return Ok(out);
             }
-            out.extend_from_slice(&buf[..got as usize]);
+            out.extend_from_slice(&buf[..got]);
             // Check after appending so `out.len()` reflects what was really
             // received; `avail` is only a hint and may be zero-lying or huge.
             if out.len() > limit {
@@ -843,6 +867,7 @@ impl Session {
     }
 }
 
+#[cfg(windows)]
 fn describe_error(code: u32) -> String {
     match code {
         ERROR_WINHTTP_NAME_NOT_RESOLVED => format!("host not found (error {code})"),
@@ -854,10 +879,289 @@ fn describe_error(code: u32) -> String {
     }
 }
 
+/// Non-Windows backend errors come from `std::io`, so the numeric WinHTTP
+/// mapping has nothing to translate; callers only ever print this string.
+#[cfg(not(windows))]
+fn describe_error(code: u32) -> String {
+    format!("network error {code}")
+}
+
 /// Status codes [`get_opt`] maps to `None`.
 fn is_absent(status: u32) -> bool {
     matches!(status, 403 | 404 | 410)
 }
+
+
+// ---------------------------------------------------------------- portable backend
+//
+// Everything below is the non-Windows transport. It speaks HTTP/1.1 over
+// `std::net::TcpStream`, because the launcher ships with no crates and a TLS
+// implementation is far outside that budget: `https://` is therefore refused
+// with an explicit message rather than attempted insecurely. Plain `http://`
+// works, which covers LAN mirror servers and a room-registry host configured
+// without TLS.
+//
+// Redirects are followed (a mirror that 302s elsewhere is normal) and the body
+// is decoded from `chunked` when the server uses it, so the resume, hashing and
+// verification logic above is exercised unchanged.
+
+#[cfg(not(windows))]
+mod portable {
+    use super::{Url, CHUNK, TOO_LARGE};
+    use crate::util::Res;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// How many redirects to follow before giving up.
+    const MAX_REDIRECTS: usize = 5;
+    /// Bound on the response head (status line + headers), not the body.
+    const MAX_HEAD: usize = 64 * 1024;
+
+    fn connect(host: &str, port: u16, timeout: Duration) -> Res<TcpStream> {
+        let addr = format!("{host}:{port}");
+        let stream =
+            TcpStream::connect(&addr).map_err(|e| format!("net: cannot connect to {addr}: {e}"))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| format!("net: cannot set read timeout: {e}"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| format!("net: cannot set write timeout: {e}"))?;
+        Ok(stream)
+    }
+
+    /// Read one CRLF-terminated line, refusing anything unreasonable.
+    fn read_line<R: BufRead>(r: &mut R) -> Res<String> {
+        let mut line = String::new();
+        let n = r
+            .read_line(&mut line)
+            .map_err(|e| format!("net: reading response head failed: {e}"))?;
+        if n == 0 {
+            return Err("net: connection closed before the response head".to_string());
+        }
+        Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    }
+
+    pub struct Session {
+        /// The response body, read lazily so a large download is never buffered.
+        body: Mutex<Box<dyn Read + Send>>,
+        status: u32,
+    }
+
+    impl Session {
+        pub fn open(url: &Url) -> Res<Session> {
+            Session::open_with(url, None)
+        }
+
+        pub fn open_with(url: &Url, headers: Option<&str>) -> Res<Session> {
+            Session::open_req(url, "GET", headers, None)
+        }
+
+        pub fn open_req(
+            url: &Url,
+            verb: &str,
+            headers: Option<&str>,
+            body: Option<&[u8]>,
+        ) -> Res<Session> {
+            let mut current = url.clone();
+            let mut redirects = 0usize;
+            loop {
+                if current.secure {
+                    return Err(
+                        "net: this build has no TLS support; use a plain http:// mirror \
+                         (the Windows build uses WinHTTP and handles https)"
+                            .to_string(),
+                    );
+                }
+                let timeout = Duration::from_secs(30);
+                let mut stream = connect(&current.host, current.port, timeout)?;
+
+                let mut head = String::new();
+                head.push_str(&format!("{verb} {} HTTP/1.1\r\n", current.path));
+                head.push_str(&format!("Host: {}\r\n", current.host));
+                head.push_str(&format!("User-Agent: {}\r\n", super::AGENT));
+                head.push_str("Accept: */*\r\n");
+                head.push_str("Connection: close\r\n");
+                if let Some(h) = headers {
+                    // Callers pass CRLF-terminated `Name: value` lines.
+                    head.push_str(h);
+                }
+                if let Some(b) = body {
+                    head.push_str(&format!("Content-Length: {}\r\n", b.len()));
+                }
+                head.push_str("\r\n");
+
+                stream
+                    .write_all(head.as_bytes())
+                    .map_err(|e| format!("net: sending request failed: {e}"))?;
+                if let Some(b) = body {
+                    stream
+                        .write_all(b)
+                        .map_err(|e| format!("net: sending body failed: {e}"))?;
+                }
+                stream
+                    .flush()
+                    .map_err(|e| format!("net: flushing request failed: {e}"))?;
+
+                let mut r = BufReader::new(stream);
+                let status_line = read_line(&mut r)?;
+                let mut parts = status_line.split_whitespace();
+                let _http = parts.next();
+                let status: u32 = parts
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| format!("net: malformed status line: {status_line}"))?;
+
+                let mut location: Option<String> = None;
+                let mut chunked = false;
+                let mut content_len: Option<usize> = None;
+                let mut head_bytes = status_line.len();
+                loop {
+                    let line = read_line(&mut r)?;
+                    if line.is_empty() {
+                        break;
+                    }
+                    head_bytes += line.len();
+                    if head_bytes > MAX_HEAD {
+                        return Err("net: response head too large".to_string());
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        let name = name.trim().to_ascii_lowercase();
+                        let value = value.trim();
+                        match name.as_str() {
+                            "location" => location = Some(value.to_string()),
+                            "transfer-encoding"
+                                if value.to_ascii_lowercase().contains("chunked") =>
+                            {
+                                chunked = true
+                            }
+                            "content-length" => content_len = value.parse().ok(),
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Redirects: re-issue the request against the new target.
+                if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                    if let Some(loc) = location {
+                        redirects += 1;
+                        if redirects > MAX_REDIRECTS {
+                            return Err(format!("net: too many redirects from {}", url.host));
+                        }
+                        current = if loc.starts_with("http://") || loc.starts_with("https://") {
+                            Url::parse(&loc)?
+                        } else {
+                            // Relative redirect: keep the authority, take the path.
+                            let port = if current.port == 80 {
+                                String::new()
+                            } else {
+                                format!(":{}", current.port)
+                            };
+                            Url::parse(&format!("http://{}{port}{loc}", current.host))?
+                        };
+                        continue;
+                    }
+                }
+
+                let reader: Box<dyn Read + Send> = if chunked {
+                    Box::new(ChunkedReader::new(r))
+                } else if let Some(n) = content_len {
+                    Box::new(r.take(n as u64))
+                } else {
+                    Box::new(r)
+                };
+                return Ok(Session { body: Mutex::new(reader), status });
+            }
+        }
+
+        pub fn status(&self) -> Res<u32> {
+            Ok(self.status)
+        }
+
+        pub fn read_chunk(&self, buf: &mut [u8]) -> Res<usize> {
+            let mut body = self
+                .body
+                .lock()
+                .map_err(|_| "net: response body lock poisoned".to_string())?;
+            body.read(buf)
+                .map_err(|e| format!("net: reading response body failed: {e}"))
+        }
+
+        pub fn read_all(&self, limit: usize, deadline: Option<Instant>) -> Res<Vec<u8>> {
+            let mut out: Vec<u8> = Vec::new();
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                if let Some(d) = deadline {
+                    if Instant::now() >= d {
+                        return Err("net: response not complete (abandoned)".to_string());
+                    }
+                }
+                let got = self.read_chunk(&mut buf)?;
+                if got == 0 {
+                    return Ok(out);
+                }
+                out.extend_from_slice(&buf[..got]);
+                if out.len() > limit {
+                    return Err(format!("net: {TOO_LARGE} (more than {limit} bytes; refused)"));
+                }
+            }
+        }
+    }
+
+    /// Decoder for `Transfer-Encoding: chunked`.
+    struct ChunkedReader<R: BufRead> {
+        inner: R,
+        left: usize, // bytes left in the current chunk
+        done: bool,
+    }
+
+    impl<R: BufRead> ChunkedReader<R> {
+        fn new(inner: R) -> Self {
+            ChunkedReader { inner, left: 0, done: false }
+        }
+    }
+
+    impl<R: BufRead> Read for ChunkedReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.done {
+                return Ok(0);
+            }
+            if self.left == 0 {
+                // Read the next size line; 0 terminates the body.
+                let mut line = String::new();
+                if self.inner.read_line(&mut line)? == 0 {
+                    self.done = true;
+                    return Ok(0);
+                }
+                let size = usize::from_str_radix(line.trim(), 16).unwrap_or(0);
+                if size == 0 {
+                    self.done = true;
+                    return Ok(0);
+                }
+                self.left = size;
+            }
+            let want = buf.len().min(self.left);
+            let got = self.inner.read(&mut buf[..want])?;
+            if got == 0 {
+                self.done = true;
+                return Ok(0);
+            }
+            self.left -= got;
+            if self.left == 0 {
+                // Swallow the CRLF that follows each chunk.
+                let mut crlf = String::new();
+                let _ = self.inner.read_line(&mut crlf);
+            }
+            Ok(got)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+use portable::Session;
+
 
 fn open_with_status(url: &Url) -> Res<(Session, u32)> {
     let s = Session::open(url)?;
@@ -1289,36 +1593,14 @@ fn try_download(
     let mut buf = vec![0u8; CHUNK];
 
     let res: Res<()> = loop {
-        let mut avail: u32 = 0;
-        if unsafe { WinHttpQueryDataAvailable(session.request.0, &mut avail) } == 0 {
-            break Err(format!(
-                "net: reading body of {orig} failed: {}",
-                describe_error(last_error())
-            ));
-        }
-        if avail == 0 {
-            break Ok(());
-        }
-        let want = avail.min(buf.len() as u32);
-        let mut got: u32 = 0;
-        if unsafe {
-            WinHttpReadData(
-                session.request.0,
-                buf.as_mut_ptr() as *mut Void,
-                want,
-                &mut got,
-            )
-        } == 0
-        {
-            break Err(format!(
-                "net: reading body of {orig} failed: {}",
-                describe_error(last_error())
-            ));
-        }
+        let got = match session.read_chunk(&mut buf) {
+            Ok(n) => n,
+            Err(e) => break Err(format!("net: reading body of {orig} failed: {e}")),
+        };
         if got == 0 {
             break Ok(());
         }
-        let chunk = &buf[..got as usize];
+        let chunk = &buf[..got];
         if let Err(e) = file.write_all(chunk) {
             break Err(format!("cannot write {}: {e}", tmp.display()));
         }
