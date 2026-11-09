@@ -414,6 +414,12 @@ struct App {
     /// theme changes, so switching palettes does not leak GDI handles.
     icon_big: HICON,
     icon_small: HICON,
+    /// Nav-rail entry under the pointer, or `usize::MAX` for none.
+    ///
+    /// Stored on `App` rather than recomputed in `paint` because `paint` has no
+    /// pointer: the only way it learns about the mouse is this field, set from
+    /// `WM_MOUSEMOVE` and cleared by `WM_MOUSELEAVE`.
+    nav_hover: usize,
 }
 
 impl App {
@@ -555,6 +561,7 @@ impl App {
             theme_box: std::ptr::null_mut(),
             icon_big: std::ptr::null_mut(),
             icon_small: std::ptr::null_mut(),
+            nav_hover: usize::MAX,
             version_choices: Vec::new(),
             // Muted dark palette, easy on the eyes next to the game.
             bg: rgb(24, 26, 30),
@@ -567,6 +574,23 @@ impl App {
             accent: rgb(88, 166, 255),
             // Brighter accent for the pressed state.
             accent_hi: rgb(130, 192, 255),
+        }
+    }
+
+    /// Current progress as a 0..=100 percentage, for the drawn bar.
+    ///
+    /// Reads the same `prog` sample the worker publishes, so the bar and the
+    /// status line can never disagree about how far along a download is. The
+    /// lock is held only long enough to copy two integers.
+    fn prog_pct(&self) -> u32 {
+        let snap = match self.prog.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        match snap {
+            Some((_, done, total)) if total > 0 => ((done.min(total) * 100) / total) as u32,
+            Some((_, _, _)) => 0,
+            None => 0,
         }
     }
 
@@ -774,6 +798,65 @@ unsafe extern "system" fn wnd_proc(
                 return (if list { app.bg_brush } else { app.card_brush }) as isize;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_MOUSEMOVE => {
+            // The rail is owner-drawn, so hover has to be hit-tested here for
+            // the same reason clicks are: Windows knows nothing about it.
+            if !app_ptr.is_null() {
+                let app = &mut *app_ptr;
+                let x = (lparam & 0xFFFF) as u16 as i16 as i32;
+                let y = ((lparam >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let mut hit = usize::MAX;
+                if x <= NAV_W && y >= NAV_TOP {
+                    for i in 0..TABS {
+                        let r = nav_item_rect(i);
+                        if y >= r.top && y <= r.bottom {
+                            hit = i;
+                            break;
+                        }
+                    }
+                }
+                if hit != app.nav_hover {
+                    app.nav_hover = hit;
+                    // Repaint only the rail: repainting the page for a hover
+                    // would throw away the log's scroll position every time the
+                    // pointer crossed the window.
+                    unsafe {
+                        InvalidateRect(
+                            app.hwnd,
+                            &RECT { left: 0, top: NAV_TOP, right: NAV_W, bottom: NAV_TOP + NAV_CAP_H + TABS as i32 * (NAV_ITEM_H + NAV_ITEM_GAP) },
+                            0,
+                        );
+                    }
+                }
+                // Ask for WM_MOUSELEAVE, which is what clears the stale hover.
+                let mut tme = TRACKMOUSEEVENT {
+                    cb_size: std::mem::size_of::<TRACKMOUSEEVENT>() as DWORD,
+                    dw_flags: TME_LEAVE,
+                    hwnd_track: app.hwnd,
+                    dw_hover_time: 0,
+                };
+                unsafe {
+                    TrackMouseEvent(&mut tme);
+                }
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            if !app_ptr.is_null() {
+                let app = &mut *app_ptr;
+                if app.nav_hover != usize::MAX {
+                    app.nav_hover = usize::MAX;
+                    unsafe {
+                        InvalidateRect(
+                            app.hwnd,
+                            &RECT { left: 0, top: NAV_TOP, right: NAV_W, bottom: NAV_TOP + NAV_CAP_H + TABS as i32 * (NAV_ITEM_H + NAV_ITEM_GAP) },
+                            0,
+                        );
+                    }
+                }
+            }
+            0
         }
         WM_KEYDOWN => {
             // Ctrl+Enter launches, F5 downloads/repairs — the two things users do
@@ -1159,7 +1242,9 @@ fn classify(app: &mut App) {
         app.play,
         app.install,
         app.status,
-        app.progress,
+        // `app.progress` is deliberately absent: the stock control is kept
+        // hidden and the bar is drawn by `paint`, so `show_tab` must not
+        // resurrect it.
         app.log,
     ];
     app.set_ctl = vec![
@@ -1361,7 +1446,7 @@ fn build_launch_page(app: &mut App) {
             "Steve",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_USER,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.memory = child(
             app.hwnd,
@@ -1377,7 +1462,7 @@ fn build_launch_page(app: &mut App) {
             "",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_DIR,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.pick = child(app.hwnd, "BUTTON", "…", WS_TABSTOP, ID_DIRPICK, 0);
         app.instance_edit = child(
@@ -1386,7 +1471,7 @@ fn build_launch_page(app: &mut App) {
             "default",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_INSTANCE,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.profile_box = child(
             app.hwnd,
@@ -1408,7 +1493,13 @@ fn build_launch_page(app: &mut App) {
         );
         app.play = child(app.hwnd, "BUTTON", "启动游戏", WS_TABSTOP, ID_PLAY, 0);
         app.install = child(app.hwnd, "BUTTON", "下载 / 修复", WS_TABSTOP, ID_INSTALL, 0);
+        // Kept for its geometry only: the bar is owner-drawn in `paint`
+        // (a stock progress control has a square trough that ignores the theme
+        // and cannot be rounded). `child()` always adds `WS_VISIBLE`, and this
+        // control is deliberately absent from `launch_ctl`, so nothing else
+        // would ever hide it — hence the explicit `SW_HIDE` here.
         app.progress = child(app.hwnd, "msctls_progress32", "", 0, ID_PROGRESS, 0);
+        ShowWindow(app.progress, SW_HIDE);
         app.status = child(app.hwnd, "STATIC", "就绪", DT_LEFT, ID_STATUS, 0);
         app.log = child(
             app.hwnd,
@@ -1416,7 +1507,7 @@ fn build_launch_page(app: &mut App) {
             "",
             WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             ID_LAUNCH_LOG,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         SendMessageW(app.log, WM_SETFONT, app.font_log as WPARAM, 1);
 
@@ -1477,7 +1568,7 @@ fn build_settings_page(app: &mut App) {
             "",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_SET_JAVA,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.java_pick = child(app.hwnd, "BUTTON", "…", WS_TABSTOP, ID_SET_JAVA_PICK, 0);
         app.save_btn = child(app.hwnd, "BUTTON", "保存设置", WS_TABSTOP, ID_SAVE, 0);
@@ -1494,7 +1585,7 @@ fn build_settings_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY,
+            WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY,
             ID_JAVA_LIST,
             0,
         );
@@ -1565,7 +1656,7 @@ fn build_tools_page(app: &mut App) {
             "",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_DL_URL,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.dl_dir = child(
             app.hwnd,
@@ -1573,7 +1664,7 @@ fn build_tools_page(app: &mut App) {
             "",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_DL_DIR,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.dl_threads = child(
             app.hwnd,
@@ -1592,7 +1683,7 @@ fn build_tools_page(app: &mut App) {
             "",
             WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             ID_TOOL_LOG,
-            WS_EX_CLIENTEDGE,
+            0,
         );
 
         for h in [
@@ -1663,7 +1754,7 @@ fn build_mods_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_MOD_LIST,
             0,
         );
@@ -1728,7 +1819,7 @@ fn build_search_page(app: &mut App) {
             "",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_SRCH_QUERY,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.srch_btn = child(app.hwnd, "BUTTON", "搜索", WS_TABSTOP, ID_SRCH_BTN, 0);
         app.srch_dl = child(app.hwnd, "BUTTON", "下载选中", WS_TABSTOP, ID_SRCH_DL, 0);
@@ -1737,7 +1828,7 @@ fn build_search_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_SRCH_LIST,
             0,
         );
@@ -1771,7 +1862,7 @@ fn build_version_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_VER_MODLIST,
             0,
         );
@@ -1782,7 +1873,7 @@ fn build_version_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_VER_LIST,
             0,
         );
@@ -1812,7 +1903,7 @@ fn build_notify_page(app: &mut App) {
             "",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_NOTIFY_URL,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.notify_check = child(app.hwnd, "BUTTON", "检查更新", WS_TABSTOP, ID_NOTIFY_CHECK, 0);
         app.notify_auto = child(
@@ -1830,7 +1921,7 @@ fn build_notify_page(app: &mut App) {
             app.hwnd,
             "LISTBOX",
             "",
-            WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
             ID_NOTIFY_LIST,
             0,
         );
@@ -1840,7 +1931,7 @@ fn build_notify_page(app: &mut App) {
             "",
             WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             ID_NOTIFY_BODY,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         for h in [
             app.notify_url,
@@ -1871,7 +1962,7 @@ fn build_host_page(app: &mut App) {
             "25565",
             WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
             ID_HOST_PORT,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.host_copy = child(app.hwnd, "BUTTON", "复制地址", WS_TABSTOP, ID_HOST_COPY, 0);
         app.host_addr = child(
@@ -1880,7 +1971,7 @@ fn build_host_page(app: &mut App) {
             "",
             ES_MULTILINE | ES_READONLY | WS_VSCROLL,
             ID_HOST_ADDR,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.host_status = child(app.hwnd, "STATIC", "", DT_LEFT, ID_HOST_STATUS, 0);
         // Room-code row: a code box the user reads/writes, plus the three
@@ -1891,7 +1982,7 @@ fn build_host_page(app: &mut App) {
             "",
             WS_TABSTOP | ES_AUTOHSCROLL | ES_UPPERCASE,
             ID_HOST_ROOM,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.host_room_new = child(app.hwnd, "BUTTON", "建房号", WS_TABSTOP, ID_HOST_ROOM_NEW, 0);
         app.host_room_join = child(app.hwnd, "BUTTON", "用房间号连接", WS_TABSTOP, ID_HOST_ROOM_JOIN, 0);
@@ -1904,7 +1995,7 @@ fn build_host_page(app: &mut App) {
             "",
             WS_TABSTOP | ES_AUTOHSCROLL,
             ID_HOST_SERVER,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.host_info = child(
             app.hwnd,
@@ -1912,7 +2003,7 @@ fn build_host_page(app: &mut App) {
             "",
             ES_MULTILINE | ES_READONLY | WS_VSCROLL,
             ID_HOST_INFO,
-            WS_EX_CLIENTEDGE,
+            0,
         );
         app.host_ctl = vec![
             app.host_detect,
@@ -2638,7 +2729,10 @@ const PAGES: [(&str, &str, &str); TABS] = [
 /// rectangle is now derived from these constants through the helpers below, and
 /// `paint()` calls the *same* helpers as `layout()`, so the two cannot drift.
 const PAD: i32 = 18; // outer margin, and the label column's left edge
-const LABEL_W: i32 = 76; // width of the "版本" / "游戏目录" label column
+// Width of the label column. "Java 路径" needs 58 px at the shipped font and
+// the box is `LABEL_W - GAP`, so 76 left 6 px of slack and the label's leading
+// stroke was clipped. 86 gives the box 74 px.
+const LABEL_W: i32 = 86;
 const ROW_H: i32 = 28; // height of an edit / combo / button — one height, one row
 const GAP: i32 = 12; // horizontal gap between two controls in a row
 const ROW_GAP: i32 = 38; // vertical distance between row baselines
@@ -2692,6 +2786,85 @@ fn nav_item_rect(i: usize) -> RECT {
         top,
         right: NAV_W - NAV_RAIL_PAD,
         bottom: top + NAV_ITEM_H,
+    }
+}
+
+/// How far a single-line edit must drop for its text to centre.
+///
+/// A single-line `EDIT` positions its text from the font cell rather than
+/// centring it in the client rect, so its text sits about 3.5 px high. A
+/// `COMBOBOX` does compensate, which is why a row of `[combo][edit]` showed its
+/// labels at visibly different heights — the "输入框普遍偏移" report.
+///
+/// `settle_edits` moves these controls down by `EDIT_DY`; `outline_inputs`
+/// subtracts the same value, so the drawn border stays on the row while the
+/// text lands in the middle of it.
+const EDIT_DY: i32 = 3;
+
+/// True only for a visible, single-line `Edit` control.
+///
+/// This is the single authority both `settle_edits` and `outline_inputs` use.
+/// It reads the real window class and style at runtime, so a stale hand-written
+/// list can never again make a `ComboBox` (or a multi-line read-only panel)
+/// receive the nudge meant for a plain edit — which is exactly what happened
+/// when `version` / `memory` / `dl_threads` were listed as edits.
+///
+/// The visibility test also keeps `settle_edits` idempotent: `layout()` only
+/// re-places the controls on the active page, so hidden controls must be left
+/// alone or the offset would accumulate on every tab switch.
+unsafe fn is_single_line_edit(h: HWND) -> bool {
+    if h.is_null() || IsWindowVisible(h) == 0 {
+        return false;
+    }
+    let mut cls = [0u16; 16];
+    let n = GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32);
+    if n <= 0 || !String::from_utf16_lossy(&cls[..n as usize]).eq_ignore_ascii_case("Edit") {
+        return false;
+    }
+    (GetWindowLongPtrW(h, GWL_STYLE) as u32) & ES_MULTILINE == 0
+}
+
+/// Edit controls created directly on the main window, used as candidates.
+///
+/// `is_single_line_edit` is the authority; this list only bounds the scan, so
+/// even a stale entry cannot misclassify anything. Combo boxes (which centre
+/// their own text) and their internal edit are deliberately absent.
+fn edit_candidates(app: &App) -> [HWND; 11] {
+    [
+        app.user,
+        app.dir_edit,
+        app.instance_edit,
+        app.set_java_edit,
+        app.srch_query,
+        app.dl_url,
+        app.dl_dir,
+        app.notify_url,
+        app.host_port,
+        app.host_room,
+        app.host_server,
+    ]
+}
+
+/// Drop every visible single-line edit so its text centres on its row.
+///
+/// Runs at the end of `layout`, after the page branches have placed controls,
+/// so no page has to know the compensation exists.
+unsafe fn settle_edits(app: &App) {
+    for &h in edit_candidates(app).iter() {
+        if !is_single_line_edit(h) {
+            continue;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(h, &mut r) == 0 {
+            continue;
+        }
+        let mut tl = POINT { x: r.left, y: r.top };
+        MapWindowPoints(std::ptr::null_mut(), app.hwnd, &mut tl as *mut POINT, 1);
+        let w = r.right - r.left;
+        let ht = r.bottom - r.top;
+        // `ROW_GAP` is 30 px of slack on a 28 px row, so a 3 px drop cannot
+        // collide with the row below.
+        MoveWindow(h, tl.x, tl.y + EDIT_DY, w, ht, 0);
     }
 }
 
@@ -2752,6 +2925,11 @@ fn normalize_combo(h: HWND) {
         // A combo adds 6 px of border to its item height, so the item height
         // that makes the whole control `ROW_H` tall is `ROW_H - 6`.
         SendMessageW(h, CB_SETITEMHEIGHT, !0usize, (ROW_H - 6) as LPARAM);
+        // A `CBS_DROPDOWN` field seeded with `SetWindowTextW` keeps the whole
+        // string selected, so the control opens with a blue block over its own
+        // value ("2G" looked like a highlighted hyperlink). Collapsing the
+        // selection to an empty range at the end leaves just the caret.
+        SendMessageW(h, CB_SETEDITSEL, 0, 0);
     }
 }
 
@@ -2817,8 +2995,13 @@ fn layout(app: &App) {
                 );
 
                 // Progress / status / log live below the card.
+                //
+                // `app.progress` keeps its old geometry so the drawn bar and
+                // the (now hidden) control agree on where the row is, but the
+                // visible bar is painted by `paint` — a stock progress control
+                // cannot be rounded and its trough ignores the theme.
                 let below = card_end(top, 4, true) + CARD_PAD;
-                MoveWindow(app.progress, x, below, w, 16, 1);
+                MoveWindow(app.progress, x, below, w, 16, 0);
                 MoveWindow(app.status, x, below + 22, w, 22, 1);
                 app.log_hint(below + 52, ch, w);
             }
@@ -3007,7 +3190,13 @@ fn layout(app: &App) {
             app.theme_box,
         ] {
             normalize_combo(h);
+            // Same list, same reason: every combo needs the chevron skin, and
+            // this loop already runs on each layout pass.
+            skin_combo(h);
         }
+
+        // Single-line edits need one nudge so their text centres on the row.
+        settle_edits(app);
     }
 }
 
@@ -3166,6 +3355,11 @@ fn apply_theme(app: &mut App, index: usize, persist: bool) {
             SendMessageW(app.progress, PBM_SETBKCOLOR, 0, raised as LPARAM);
             SendMessageW(app.progress, PBM_SETBARCOLOR, 0, accent as LPARAM);
         }
+
+        // The combo chevron is painted by a subclass that cannot reach `App`,
+        // so the two colours it needs are published here, with the rest of the
+        // palette. Same seam, one more consumer.
+        set_combo_skin(card, dim, line);
 
         let big = make_fox_icon(64, accent, accent_hi);
         let small = make_fox_icon(32, accent, accent_hi);
@@ -3373,6 +3567,238 @@ fn section_head(hdc: HDC, r: RECT, text: &str, color: u32, accent: u32) {
     }
 }
 
+/// Colours for the combo chevron, published by `apply_theme`.
+///
+/// A `static` rather than a field on `App`: the subclass wndproc receives only
+/// the child `HWND`, and `GetWindowLongPtrW(GWLP_USERDATA)` on a combo belongs
+/// to the combo class. Two colours are enough and only the UI thread writes.
+static mut COMBO_SKIN: (u32, u32, u32) = (0, 0, 0);
+/// The combo class's own wndproc, captured when we subclass the first one.
+///
+/// `Option<WNDPROC>` matches `WNDCLASSEXW::lpfn_wnd_proc`, so the capture and
+/// the call both use the same representation.
+static mut COMBO_ORIG: Option<WNDPROC> = None;
+
+/// Publish the chevron and frame colours; called from `apply_theme`.
+fn set_combo_skin(card: u32, dim: u32, line: u32) {
+    unsafe {
+        COMBO_SKIN = (card, dim, line);
+    }
+}
+
+/// Repaint the drop-down button of a combo with a themed chevron.
+///
+/// `CBS_DROPDOWNLIST` always draws its own grey sunken arrow, which ignores the
+/// palette and sits on top of the themed outline — on a cream card it is the
+/// one visibly unstyled control left. Covering it here, inside the control's
+/// own `WM_PAINT`, is the only place the overpaint survives: a child window
+/// paints after its parent, so nothing drawn from `paint()` can cover it.
+unsafe extern "system" fn combo_proc(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let result = match COMBO_ORIG {
+        Some(prev) => CallWindowProcW(prev, hwnd, msg, wparam, lparam),
+        None => DefWindowProcW(hwnd, msg, wparam, lparam),
+    };
+    if msg == WM_PAINT {
+        let (card, dim, line) = COMBO_SKIN;
+        if dim != 0 {
+            let mut rc = RECT::default();
+            GetClientRect(hwnd, &mut rc);
+            let btn_w = GetSystemMetrics(SM_CXVSCROLL);
+            let hdc = GetDC(hwnd);
+
+            // 1. Cover the drop-down button. The class has already painted its
+            //    own grey sunken button plus the vertical separator to its
+            //    left, so this erases from the separator outwards. Two extra
+            //    pixels of width catch the separator and its highlight, which
+            //    sit just left of the button proper.
+            let btn = RECT {
+                left: rc.right - btn_w - 2,
+                top: 0,
+                right: rc.right,
+                bottom: rc.bottom,
+            };
+            if btn.right > btn.left {
+                let brush = CreateSolidBrush(card);
+                FillRect(hdc, &btn, brush);
+                DeleteObject(brush as HGDIOBJ);
+            }
+
+            // 2. Cover the class's internal 1 px grey border, which it paints
+            //    just inside the client rect on all four sides.
+            let band = CreateSolidBrush(line);
+            FrameRect(hdc, &rc, band);
+            let inner = RECT {
+                left: rc.left + 1,
+                top: rc.top + 1,
+                right: rc.right - 1,
+                bottom: rc.bottom - 1,
+            };
+            FrameRect(hdc, &inner, band);
+            DeleteObject(band as HGDIOBJ);
+
+            // 3. Our chevron, centred in the button we just cleared.
+            let cx = (btn.left + btn.right) / 2;
+            let cy = (btn.top + btn.bottom) / 2;
+            let pen = CreatePen(PS_SOLID, 1, dim);
+            let old = SelectObject(hdc, pen);
+            // `LineTo` draws up to — but not including — its endpoint, so the
+            // right stroke overshoots by one pixel or the halves leave a gap
+            // and the chevron reads as a backslash.
+            MoveToEx(hdc, cx - 3, cy - 1, std::ptr::null_mut());
+            LineTo(hdc, cx + 1, cy + 3);
+            MoveToEx(hdc, cx + 1, cy + 3, std::ptr::null_mut());
+            LineTo(hdc, cx + 4, cy - 1);
+            SelectObject(hdc, old);
+            DeleteObject(pen);
+            ReleaseDC(hwnd, hdc);
+        }
+    }
+    result
+}
+
+/// Install `combo_proc` on a combo, capturing the class proc once.
+///
+/// Combos of the same class share one window procedure, so the first capture
+/// serves every control. Calling this repeatedly is harmless: the check below
+/// skips a control that is already ours.
+unsafe fn skin_combo(h: HWND) {
+    if h.is_null() {
+        return;
+    }
+    // The combo class paints an internal sunken border of its own. Stripping
+    // `WS_EX_CLIENTEDGE` here (it is set by the class default even when the
+    // caller passes 0) lets the subclass's 1 px frame be the only edge, which
+    // is what makes a combo match the edits beside it.
+    let ex = GetWindowLongPtrW(h, GWL_EXSTYLE) as u32;
+    if ex & WS_EX_CLIENTEDGE != 0 {
+        SetWindowLongPtrW(h, GWL_EXSTYLE, (ex & !WS_EX_CLIENTEDGE) as isize);
+        // `SetWindowLongPtrW` only records the new style; the non-client area
+        // (where the sunken edge is drawn) is not recomputed until
+        // `SWP_FRAMECHANGED`, so without this the grey frame stays on screen
+        // even though the style no longer contains it.
+        SetWindowPos(
+            h,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+    // `set_combo_skin` runs first (from `apply_theme`), so the static is
+    // initialised; read the captured proc through a raw pointer to avoid a
+    // `static mut` reference.
+    let ours: isize = std::mem::transmute::<WNDPROC, isize>(combo_proc);
+    let captured = std::ptr::addr_of!(COMBO_ORIG).read();
+    match captured {
+        Some(_) => {
+            if GetWindowLongPtrW(h, GWL_WNDPROC) != ours {
+                SetWindowLongPtrW(h, GWL_WNDPROC, ours);
+            }
+        }
+        None => {
+            let prev = SetWindowLongPtrW(h, GWL_WNDPROC, ours);
+            if prev != 0 {
+                let p = std::mem::transmute::<isize, WNDPROC>(prev);
+                std::ptr::addr_of_mut!(COMBO_ORIG).write(Some(p));
+            }
+        }
+    }
+}
+
+/// Outline the input controls that no longer carry a Win32 border.
+///
+/// The rect comes from the control itself (`GetWindowRect` + `MapWindowPoints`),
+/// so this cannot drift from `layout()`. Two pixel treatments:
+///
+/// * edit / combo fields get a 1 px `line` rule and a `card` fill behind them,
+///   which is what the removed `WS_EX_CLIENTEDGE` used to supply, minus the
+///   untemplated grey and the 2 px inset;
+/// * list boxes get the same rule but no fill, because they sit on the page
+///   background and `WM_CTLCOLORLISTBOX` already paints their interior.
+fn outline_inputs(app: &App, hdc: HDC) {
+    // Edits and single-line fields: these lost `WS_EX_CLIENTEDGE`.
+    let fields = [
+        app.user,
+        app.dir_edit,
+        app.instance_edit,
+        app.set_java_edit,
+        app.srch_query,
+        app.dl_url,
+        app.dl_dir,
+        app.notify_url,
+        app.host_port,
+        app.host_addr,
+        app.host_room,
+        app.host_server,
+        app.tool_log,
+    ];
+    // Multi-line read-only panels: they lost `WS_EX_CLIENTEDGE` too and read as
+    // floating text without a boundary.
+    let panels = [
+        app.log,
+        app.notify_body,
+        app.ver_info,
+        app.host_info,
+        app.mod_hint,
+    ];
+    // List boxes: these only lost `WS_BORDER`.
+    let lists = [
+        app.java_list,
+        app.mod_list,
+        app.srch_list,
+        app.ver_list,
+        app.ver_modlist,
+        app.notify_list,
+    ];
+    unsafe {
+        let brush = CreateSolidBrush(app.line);
+        for &h in fields
+            .iter()
+            .chain(panels.iter())
+            .chain(lists.iter())
+        {
+            if h.is_null() || IsWindowVisible(h) == 0 {
+                continue;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(h, &mut r) == 0 {
+                continue;
+            }
+            let mut tl = POINT { x: r.left, y: r.top };
+            let mut br = POINT { x: r.right, y: r.bottom };
+            MapWindowPoints(std::ptr::null_mut(), app.hwnd, &mut tl as *mut POINT, 1);
+            MapWindowPoints(std::ptr::null_mut(), app.hwnd, &mut br as *mut POINT, 1);
+            // Single-line edits were nudged down by `settle_edits`; undo that
+            // here so the border stays on the row, flush with the combos. The
+            // same runtime predicate decides both, so a stale handle list can
+            // never put a border where no nudge happened (or vice versa).
+            let nudge = if is_single_line_edit(h) { EDIT_DY } else { 0 };
+            tl.y -= nudge;
+            br.y -= nudge;
+            // Right/bottom of a window rect are exclusive, and with the
+            // client edge gone the window rect *is* the client rect — so a
+            // frame ending at `br` would draw its right and bottom edges inside
+            // the control and be painted over by it. One pixel further out puts
+            // all four edges beyond the client area, where they survive.
+            let rr = RECT {
+                left: tl.x - 1,
+                top: tl.y - 1,
+                right: br.x + 1,
+                bottom: br.y + 1,
+            };
+            FrameRect(hdc, &rr, brush);
+        }
+        DeleteObject(brush as HGDIOBJ);
+    }
+}
+
 /// A card: a rounded panel with a hairline border, behind a group of controls.
 fn card(hdc: HDC, r: RECT, app: &App) {
     unsafe {
@@ -3534,6 +3960,7 @@ fn set_bold_font(f: HFONT) {
 fn paint_nav_item(app: &App, hdc: HDC, i: usize) {
     let r = nav_item_rect(i);
     let active = app.tab == i;
+    let hover = app.nav_hover == i;
     if active {
         // Soft accent wash behind the label, then a 3 px bar on the left edge:
         // the same "selected" language the list boxes use.
@@ -3548,6 +3975,13 @@ fn paint_nav_item(app: &App, hdc: HDC, i: usize) {
             );
             SelectObject(hdc, app.font_bold as HGDIOBJ);
         }
+    } else if hover {
+        // A wash one step lighter than the rail, with no border: the entry has
+        // to read as "reachable", not as "already selected".
+        unsafe {
+            round_fill(hdc, r, 9, app.raised, None);
+            SelectObject(hdc, app.font_ui as HGDIOBJ);
+        }
     } else {
         unsafe {
             SelectObject(hdc, app.font_ui as HGDIOBJ);
@@ -3558,7 +3992,13 @@ fn paint_nav_item(app: &App, hdc: HDC, i: usize) {
         PAGES[i].0,
         RECT { left: r.left + 16, top: r.top, right: r.right - 8, bottom: r.bottom },
         DT_LEFT | DT_SINGLELINE | DT_VCENTER,
-        if active { app.accent } else { app.dim },
+        if active {
+            app.accent
+        } else if hover {
+            app.ink
+        } else {
+            app.dim
+        },
     );
 }
 
@@ -3778,6 +4218,35 @@ fn paint(app: &App) {
                         app.dim,
                     );
                 }
+
+                // Slim rounded progress bar under the card, painted rather than
+                // delegated to the stock control: that one has a square trough
+                // which ignores the theme, and at 0 % it is a meaningless empty
+                // beige box. Here an empty bar is a quiet hairline track.
+                let bar_top = card_end(top, 4, true) + CARD_PAD;
+                let bar = RECT {
+                    left: page_x(),
+                    top: bar_top,
+                    right,
+                    bottom: bar_top + 6,
+                };
+                // A 6 px track with hairline separation reads as a meter; the
+                // 8 px version at `raised` was the same beige as the card and
+                // read as another rule line.
+                round_fill(hdc, bar, 3, app.raised, Some(app.line));
+                let pct = app.prog_pct();
+                if pct > 0 {
+                    let filled = ((bar.right - bar.left) * pct as i32 / 100)
+                        .max(6)
+                        .min(bar.right - bar.left);
+                    round_fill(
+                        hdc,
+                        RECT { left: bar.left, top: bar.top, right: bar.left + filled, bottom: bar.bottom },
+                        3,
+                        app.accent,
+                        None,
+                    );
+                }
             }
             1 => {
                 // Three cards, each with a heading band and one row.
@@ -3993,6 +4462,10 @@ fn paint(app: &App) {
             }
             _ => {}
         }
+
+        // Second pass: outlines for the controls whose Win32 border was
+        // removed, drawn on top so no card fill can cover them.
+        outline_inputs(app, hdc);
 
         EndPaint(app.hwnd, &ps);
     }

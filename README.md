@@ -1,6 +1,6 @@
 # LightFoxLauncher — a minimal Minecraft launcher in Rust
 
-Version 0.5.0 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
+Version 0.5.1 — see [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 [![Licence: MPL-2.0](https://img.shields.io/badge/licence-MPL--2.0-brightgreen)](LICENSE)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-blue)](Cargo.lock)
@@ -16,7 +16,7 @@ the engine and CLI also build and run on Linux and macOS.
 
 | Binary | Size | What it is |
 |---|---|---|
-| `LFL-gui.exe` | **745,984 B (0.71 MiB)** | native Win32 window: nav rail, five themes, pick version, click play |
+| `LFL-gui.exe` | **748,544 B (0.71 MiB)** | native Win32 window: nav rail, five themes, pick version, click play |
 | `LFL.exe` | **526,848 B (0.50 MiB)** | command line, scriptable |
 
 The window has a **theme system**: 暖狐 (default), 雪白, 夜色, 森绿, 星紫, chosen in

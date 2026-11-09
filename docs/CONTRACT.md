@@ -160,6 +160,35 @@ means rewriting `apply_theme` only; the palette table and every `App` field stay
 A theme key is a short ASCII token ([`settings::valid_theme_name`]). Unknown keys fall back to the
 default rather than failing to load: a hand-edited `theme=` must never make the launcher unopenable.
 
+### Control painting contract
+
+Windows draws its own borders and buttons for `EDIT`, `LISTBOX` and `COMBOBOX`, and none of them
+follow the palette. Left alone they are the only visibly unstyled elements in the window, so the
+rules below are part of the look, not decoration:
+
+1. **No `WS_EX_CLIENTEDGE`, no `WS_BORDER`.** Every EDIT and list box is created without them.
+   `outline_inputs` draws a 1 px `line` frame from the control's own window rect
+   (`GetWindowRect` + `MapWindowPoints`), so the frame cannot drift from `layout()`.
+2. **The outliner runs after the page body.** It is a second pass inside `paint`, after the cards
+   and the page-specific drawing, so no card fill can cover a border.
+3. **A combo draws itself.** `CBS_DROPDOWNLIST` keeps a sunken button, a separator and an internal
+   1 px frame, all unpalettable. `combo_proc` subclasses the control's own `WM_PAINT`, calls the
+   class proc first (so typing, caret, selection and the drop-down list are untouched), then
+   clears the button strip and draws the chevron and frame. Painting from the parent's DC cannot
+   work: a child window paints after its parent, so an overlay there is always covered.
+4. **The progress bar is drawn, not delegated.** `msctls_progress32` has a square trough whose
+   colours cannot be rounded and whose 0 % state is a meaningless empty box. The control still
+   exists for its geometry but is never shown; `paint` draws a 3 px rounded track from
+   `App::prog_pct()` — the same sample the status line prints, so the two cannot disagree.
+5. **Hover needs explicit tracking.** The nav rail is owner-drawn, so `WM_MOUSEMOVE` hit-tests it
+   by hand and `TrackMouseEvent`/`WM_MOUSELEAVE` clear the state. Without the leave message the
+   highlight sticks to whichever entry the pointer left last.
+6. **Combo selections are collapsed after layout.** `SetWindowTextW` on a `CBS_DROPDOWN` leaves the
+   whole string selected, so seeded fields opened with a blue block over their own value.
+   `normalize_combo` ends with `CB_SETEDITSEL 0,0`.
+
+Every colour above comes from `apply_theme`; nothing in this list may hard-code one.
+
 ### Platform contract
 
 `LFL-gui` is native Win32 and Windows-only; off Windows the binary compiles to a stub that points

@@ -162,6 +162,7 @@ pub const WM_QUIT: UINT = 0x0012;
 pub const WM_ERASEBKGND: UINT = 0x0014;
 pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_LBUTTONDOWN: UINT = 0x0201;
+pub const WM_MOUSEMOVE: UINT = 0x0200;
 pub const WM_LBUTTONUP: UINT = 0x0202;
 pub const WM_SETCURSOR: UINT = 0x0020;
 pub const WM_GETMINMAXINFO: UINT = 0x0024;
@@ -211,10 +212,16 @@ pub const LBS_STANDARD: DWORD = LBS_NOTIFY | 0x0020_0000 | WS_BORDER;
 
 /// `GWL_STYLE`, read to add `BS_OWNERDRAW` to a button's existing style.
 pub const GWL_STYLE: i32 = -16;
+/// `GWL_WNDPROC`, read/written to subclass a control.
+pub const GWL_WNDPROC: i32 = -4;
+/// `GWL_EXSTYLE`, read to inspect/strip a control's extended style.
+pub const GWL_EXSTYLE: i32 = -20;
 
 pub const CB_ADDSTRING: UINT = 0x0143;
 pub const CB_SETCURSEL: UINT = 0x014E;
 pub const CB_GETCURSEL: UINT = 0x0147;
+/// Collapse a `CBS_DROPDOWN` field's selection down to a caret.
+pub const CB_SETEDITSEL: UINT = 0x0142;
 pub const CB_GETLBTEXT: UINT = 0x0148;
 pub const CB_GETLBTEXTLEN: UINT = 0x0149;
 pub const CB_FINDSTRINGEXACT: UINT = 0x0158;
@@ -269,6 +276,8 @@ pub const PS_SOLID: i32 = 0;
 pub const INFINITE: DWORD = 0xFFFF_FFFF;
 pub const PM_REMOVE: UINT = 0x0001;
 pub const SM_CXSCREEN: i32 = 0;
+/// Width of a vertical scrollbar / combo drop-down button (17 at 96 dpi).
+pub const SM_CXVSCROLL: i32 = 2;
 pub const SM_CYSCREEN: i32 = 1;
 pub const GWLP_USERDATA: i32 = -21;
 pub const SWP_NOSIZE: UINT = 0x0001;
@@ -276,6 +285,8 @@ pub const SWP_NOMOVE: UINT = 0x0002;
 pub const SWP_NOZORDER: UINT = 0x0004;
 pub const SWP_NOACTIVATE: UINT = 0x0010;
 pub const SWP_SHOWWINDOW: UINT = 0x0040;
+/// Recompute the non-client area after a style change.
+pub const SWP_FRAMECHANGED: UINT = 0x0020;
 pub const SW_HIDE: i32 = 0;
 
 pub const WM_SETICON: UINT = 0x0080;
@@ -330,7 +341,18 @@ extern "system" {
     pub fn GetWindowTextW(hwnd: HWND, buf: *mut u16, max: i32) -> i32;
     pub fn GetWindowTextLengthW(hwnd: HWND) -> i32;
     pub fn GetClientRect(hwnd: HWND, r: *mut RECT) -> BOOL;
+    /// Convert points between two windows' coordinate spaces.
+    pub fn MapWindowPoints(
+        from: HWND,
+        to: HWND,
+        pts: *mut POINT,
+        count: UINT,
+    ) -> i32;
     pub fn GetWindowRect(hwnd: HWND, r: *mut RECT) -> BOOL;
+    /// Class name of a window, used to tell an `Edit` from a `ComboBox` at
+    /// runtime instead of trusting a hand-written list of handles.
+    pub fn GetClassNameW(hwnd: HWND, buf: *mut u16, max: i32) -> i32;
+    pub fn IsWindowVisible(hwnd: HWND) -> BOOL;
     pub fn MoveWindow(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, repaint: BOOL) -> BOOL;
     pub fn SetWindowPos(hwnd: HWND, after: HWND, x: i32, y: i32, cx: i32, cy: i32, flags: UINT)
         -> BOOL;
@@ -342,6 +364,8 @@ extern "system" {
     pub fn FillRect(hdc: HDC, r: *const RECT, brush: HBRUSH) -> i32;
     pub fn DrawTextW(hdc: HDC, text: *const u16, len: i32, r: *mut RECT, fmt: UINT) -> i32;
     pub fn SetTimer(hwnd: HWND, id: usize, elapse: UINT, func: *mut c_void) -> usize;
+    /// Ask for `WM_MOUSELEAVE` once, when the pointer next leaves `hwnd`.
+    pub fn TrackMouseEvent(ev: *mut TRACKMOUSEEVENT) -> BOOL;
     pub fn RedrawWindow(
         hwnd: HWND,
         rect: *const RECT,
@@ -364,6 +388,14 @@ extern "system" {
     pub fn GetKeyState(key: i32) -> i16;
     pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
     pub fn GetWindowLongPtrW(hwnd: HWND, index: i32) -> isize;
+    /// Pass a message to the window's previous procedure (subclassing).
+    pub fn CallWindowProcW(
+        prev: WNDPROC,
+        hwnd: HWND,
+        msg: UINT,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT;
     pub fn AdjustWindowRectEx(r: *mut RECT, style: DWORD, menu: BOOL, ex_style: DWORD) -> BOOL;
 }
 
@@ -546,6 +578,18 @@ extern "system" {
 // ---- owner-drawn buttons -----------------------------------------------------
 
 pub const WM_DRAWITEM: UINT = 0x002B;
+
+/// `TRACKMOUSEEVENT`, the minimum needed to receive `WM_MOUSELEAVE`.
+#[repr(C)]
+pub struct TRACKMOUSEEVENT {
+    pub cb_size: DWORD,
+    pub dw_flags: DWORD,
+    pub hwnd_track: HWND,
+    pub dw_hover_time: DWORD,
+}
+
+pub const TME_LEAVE: DWORD = 0x0000_0002;
+pub const WM_MOUSELEAVE: UINT = 0x02A3;
 
 /// `DRAWITEMSTRUCT`, the minimum the button painter reads.
 #[repr(C)]
